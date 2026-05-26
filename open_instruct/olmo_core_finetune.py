@@ -223,13 +223,25 @@ def main(args: SFTArguments, tc: dataset_transformation.TokenizerConfig) -> None
         args.training.lr_scheduler_type, args.training.warmup_ratio, effective_steps
     )
 
+    optim_dtype_env = os.environ.get("OLMO_OPTIM_DTYPE", "").strip().lower()
+    optim_dtype = None
+    if optim_dtype_env in {"bf16", "bfloat16"}:
+        optim_dtype = DType.bfloat16
+        logger.warning("Using bfloat16 optimizer state because OLMO_OPTIM_DTYPE=%s", optim_dtype_env)
+    elif optim_dtype_env and optim_dtype_env not in {"float32", "fp32"}:
+        raise ValueError(f"Unsupported OLMO_OPTIM_DTYPE={optim_dtype_env!r}")
+
     train_module_config = train_module_lib.TransformerTrainModuleConfig(
         rank_microbatch_size=rank_microbatch_size,
         max_sequence_length=args.training.max_seq_length,
         z_loss_multiplier=None,
         compile_model=args.training.compile_model,
         optim=optim.SkipStepAdamWConfig(
-            lr=args.training.learning_rate, weight_decay=args.training.weight_decay, betas=(0.9, 0.95), compile=False
+            lr=args.training.learning_rate,
+            weight_decay=args.training.weight_decay,
+            betas=(0.9, 0.95),
+            dtype=optim_dtype,
+            compile=False,
         ),
         dp_config=dp_config,
         cp_config=cp_config,
