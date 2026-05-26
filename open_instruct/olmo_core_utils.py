@@ -206,6 +206,7 @@ def build_checkpointer_callback(
 ) -> CheckpointerCallback:
     """Construct a CheckpointerCallback with shared Open Instruct defaults."""
     return CheckpointerCallback(
+        enabled=os.environ.get("OLMO_DISABLE_CHECKPOINTS", "").strip().lower() not in {"1", "true", "yes"},
         save_interval=checkpointing_steps,
         ephemeral_save_interval=ephemeral_save_interval,
         save_async=save_async,
