@@ -231,18 +231,34 @@ def main(args: SFTArguments, tc: dataset_transformation.TokenizerConfig) -> None
     elif optim_dtype_env and optim_dtype_env not in {"float32", "fp32"}:
         raise ValueError(f"Unsupported OLMO_OPTIM_DTYPE={optim_dtype_env!r}")
 
-    train_module_config = train_module_lib.TransformerTrainModuleConfig(
-        rank_microbatch_size=rank_microbatch_size,
-        max_sequence_length=args.training.max_seq_length,
-        z_loss_multiplier=None,
-        compile_model=args.training.compile_model,
-        optim=optim.SkipStepAdamWConfig(
+    optimizer_name = os.environ.get("OLMO_OPTIMIZER", "adamw").strip().lower()
+    if optimizer_name == "adamw":
+        optim_config = optim.AdamWConfig(
+            lr=args.training.learning_rate,
+            weight_decay=args.training.weight_decay,
+            betas=(0.9, 0.95),
+            foreach=False,
+        )
+        if optim_dtype is not None:
+            logger.warning("Plain AdamW ignores OLMO_OPTIM_DTYPE=%s", optim_dtype_env)
+        logger.warning("Using plain AdamW optimizer because OLMO_OPTIMIZER=%s", optimizer_name)
+    elif optimizer_name == "skip_step_adamw":
+        optim_config = optim.SkipStepAdamWConfig(
             lr=args.training.learning_rate,
             weight_decay=args.training.weight_decay,
             betas=(0.9, 0.95),
             dtype=optim_dtype,
             compile=False,
-        ),
+        )
+    else:
+        raise ValueError(f"Unsupported OLMO_OPTIMIZER={optimizer_name!r}")
+
+    train_module_config = train_module_lib.TransformerTrainModuleConfig(
+        rank_microbatch_size=rank_microbatch_size,
+        max_sequence_length=args.training.max_seq_length,
+        z_loss_multiplier=None,
+        compile_model=args.training.compile_model,
+        optim=optim_config,
         dp_config=dp_config,
         cp_config=cp_config,
         ac_config=ac_config,
