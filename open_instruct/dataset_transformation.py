@@ -927,6 +927,41 @@ TOKENIZED_SFT_DATASET_KEYS = [INPUT_IDS_KEY, ATTENTION_MASK_KEY, LABELS_KEY]
 TOKENIZED_SFT_DATASET_KEYS_WITH_SOURCE = [INPUT_IDS_KEY, ATTENTION_MASK_KEY, LABELS_KEY, DATASET_ORIGIN_KEY]
 
 
+def _nonempty_text(value: Any) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value
+    return None
+
+
+def _assistant_content_with_reasoning(message: dict[str, Any]) -> str | None:
+    content = _nonempty_text(message.get("content"))
+    reasoning = _nonempty_text(message.get("reasoning_content")) or _nonempty_text(message.get("reasoning"))
+    if reasoning is None:
+        return content
+    if content is not None and "<think>" in content:
+        return content
+    reasoning_block = f"<think>{reasoning}</think>"
+    if content is None:
+        return reasoning_block
+    return f"{reasoning_block}\n{content}"
+
+
+def normalize_reasoning_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Fold assistant reasoning fields into content before chat-template rendering."""
+    normalized: list[dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            normalized.append(message)
+            continue
+        normalized_message = dict(message)
+        if normalized_message.get("role") == "assistant":
+            content = _assistant_content_with_reasoning(normalized_message)
+            if content is not None:
+                normalized_message["content"] = content
+        normalized.append(normalized_message)
+    return normalized
+
+
 def remove_dataset_source_field(dataset: Dataset) -> Dataset:
     """Remove dataset_source field from dataset if it exists.
 
@@ -1063,11 +1098,12 @@ TOKENIZED_PREFERENCE_DATASET_KEYS = [
 def sft_tokenize_v1(
     row: dict[str, Any], tokenizer: PreTrainedTokenizer, sft_messages_key: str = DEFAULT_SFT_MESSAGES_KEY
 ):
-    prompt = row[sft_messages_key] if len(row[sft_messages_key]) == 1 else row[sft_messages_key][:-1]
+    messages = normalize_reasoning_messages(row[sft_messages_key])
+    prompt = messages if len(messages) == 1 else messages[:-1]
 
     # return_dict=False: transformers >= 5.0 defaults to returning a dict; we need a plain list of ints.
     row[INPUT_IDS_PROMPT_KEY] = tokenizer.apply_chat_template(prompt, add_generation_prompt=True, return_dict=False)
-    row[INPUT_IDS_KEY] = tokenizer.apply_chat_template(row[sft_messages_key], return_dict=False)
+    row[INPUT_IDS_KEY] = tokenizer.apply_chat_template(messages, return_dict=False)
     row[ATTENTION_MASK_KEY] = [1] * len(row[INPUT_IDS_KEY])
     labels = copy.deepcopy(row[INPUT_IDS_KEY])
     row[LABELS_KEY] = labels
@@ -1079,10 +1115,11 @@ def sft_tokenize_mask_out_prompt_v1(
     row: dict[str, Any], tokenizer: PreTrainedTokenizer, sft_messages_key: str = DEFAULT_SFT_MESSAGES_KEY
 ):
     """mask out the prompt tokens by manipulating labels"""
-    prompt = row[sft_messages_key] if len(row[sft_messages_key]) == 1 else row[sft_messages_key][:-1]
+    messages = normalize_reasoning_messages(row[sft_messages_key])
+    prompt = messages if len(messages) == 1 else messages[:-1]
 
     row[INPUT_IDS_PROMPT_KEY] = tokenizer.apply_chat_template(prompt, add_generation_prompt=True, return_dict=False)
-    row[INPUT_IDS_KEY] = tokenizer.apply_chat_template(row[sft_messages_key], return_dict=False)
+    row[INPUT_IDS_KEY] = tokenizer.apply_chat_template(messages, return_dict=False)
     row[ATTENTION_MASK_KEY] = [1] * len(row[INPUT_IDS_KEY])
     labels = copy.deepcopy(row[INPUT_IDS_KEY])
     labels[: len(row[INPUT_IDS_PROMPT_KEY])] = [-100] * len(row[INPUT_IDS_PROMPT_KEY])
@@ -1175,7 +1212,7 @@ def mask_labels(
 
 def sft_tulu_tokenize_and_truncate_v1(row: dict[str, Any], tokenizer: PreTrainedTokenizer, max_seq_length: int):
     """taken directly from https://github.com/allenai/open-instruct/blob/ba11286e5b9eb00d4ce5b40ef4cac1389888416a/open_instruct/finetune.py#L385"""
-    messages = row["messages"]
+    messages = normalize_reasoning_messages(row["messages"])
     if len(messages) == 0:
         raise ValueError("messages field is empty.")
     input_ids_result = tokenizer.apply_chat_template(
@@ -1201,7 +1238,7 @@ def sft_tulu_tokenize_and_truncate_v1(row: dict[str, Any], tokenizer: PreTrained
 
 def last_turn_tulu_tokenize_and_truncate_v1(row: dict[str, Any], tokenizer: PreTrainedTokenizer, max_seq_length: int):
     """taken directly from https://github.com/allenai/open-instruct/blob/ba11286e5b9eb00d4ce5b40ef4cac1389888416a/open_instruct/finetune.py#L385"""
-    messages = row["messages"]
+    messages = normalize_reasoning_messages(row["messages"])
     if len(messages) == 0:
         raise ValueError("messages field is empty.")
     input_ids_result = tokenizer.apply_chat_template(
