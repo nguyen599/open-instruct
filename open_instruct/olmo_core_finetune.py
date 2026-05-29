@@ -232,6 +232,8 @@ def main(args: SFTArguments, tc: dataset_transformation.TokenizerConfig) -> None
         raise ValueError(f"Unsupported OLMO_OPTIM_DTYPE={optim_dtype_env!r}")
 
     optimizer_name = os.environ.get("OLMO_OPTIMIZER", "adamw").strip().lower()
+    if optimizer_name in {"adamw_8bits", "torchao_adamw_8bit"}:
+        optimizer_name = "adamw_8bit"
     if optimizer_name == "adamw":
         optim_config = optim.AdamWConfig(
             lr=args.training.learning_rate,
@@ -249,6 +251,26 @@ def main(args: SFTArguments, tc: dataset_transformation.TokenizerConfig) -> None
             betas=(0.9, 0.95),
             dtype=optim_dtype,
             compile=False,
+        )
+    elif optimizer_name == "adamw_8bit":
+        from olmo_torchao_optim import TorchAOAdamW8bitConfig
+
+        if optim_dtype is not None:
+            logger.warning("torchao AdamW8bit ignores OLMO_OPTIM_DTYPE=%s", optim_dtype_env)
+        optim_config = TorchAOAdamW8bitConfig(
+            lr=args.training.learning_rate,
+            weight_decay=args.training.weight_decay,
+            betas=(0.9, 0.95),
+            block_size=int(os.environ.get("OLMO_ADAMW_8BIT_BLOCK_SIZE", "256")),
+            bf16_stochastic_round=os.environ.get(
+                "OLMO_ADAMW_8BIT_BF16_STOCHASTIC_ROUND", "0"
+            ).strip().lower()
+            in {"1", "true", "yes", "on"},
+        )
+        logger.warning(
+            "Using torchao AdamW8bit optimizer with block_size=%d, bf16_stochastic_round=%s.",
+            optim_config.block_size,
+            optim_config.bf16_stochastic_round,
         )
     else:
         raise ValueError(f"Unsupported OLMO_OPTIMIZER={optimizer_name!r}")
