@@ -1283,6 +1283,32 @@ def parse_json_column_value(value: Any, field_name: str) -> Any:
         raise ValueError(f"Could not parse {field_name} as JSON: {value[:200]!r}") from exc
 
 
+def parse_qwen_tool_arguments(value: Any, field_name: str) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a JSON object, JSON string, or raw code string.")
+    stripped = value.strip()
+    if not stripped:
+        return {"code": ""}
+    if stripped[0] not in {'{', '[', '"'}:
+        return {"code": value}
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        try:
+            from json_repair import repair_json
+
+            parsed = repair_json(stripped, return_objects=True)
+        except Exception:
+            parsed = {"code": value}
+    if isinstance(parsed, dict):
+        return parsed
+    if isinstance(parsed, str):
+        return {"code": parsed}
+    raise ValueError(f"{field_name} must parse to an object or raw code string, got {type(parsed).__name__}.")
+
+
 def normalize_optional_tool_schema(value: Any, field_name: str = TOOL_SCHEMA_COLUMN_KEY) -> list[dict[str, Any]] | None:
     parsed = parse_json_column_value(value, field_name)
     if parsed is None:
@@ -1313,8 +1339,8 @@ def normalize_qwen_tool_call(tool_call: Any, message_idx: int, tool_call_idx: in
     if isinstance(function, dict):
         function = dict(function)
         arguments = function.get("arguments")
-        if isinstance(arguments, str):
-            function["arguments"] = parse_json_column_value(
+        if arguments is not None:
+            function["arguments"] = parse_qwen_tool_arguments(
                 arguments,
                 f"messages[{message_idx}].tool_calls[{tool_call_idx}].function.arguments",
             )

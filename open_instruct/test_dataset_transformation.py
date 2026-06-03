@@ -86,6 +86,60 @@ class TestConfigHash(unittest.TestCase):
         self.assertNotEqual(hash1, hash2, "Different configs should have different hashes")
 
 
+class TestQwenToolCallNormalization(unittest.TestCase):
+    def test_raw_code_tool_arguments_are_wrapped(self):
+        messages = [
+            {"role": "user", "content": "Compute gcd."},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "python",
+                            "arguments": "import math\nmath.gcd(65, 102)\n",
+                        },
+                    }
+                ],
+            },
+        ]
+
+        normalized = open_instruct.dataset_transformation.normalize_qwen_messages(messages)
+
+        self.assertEqual(
+            normalized[1]["tool_calls"][0]["function"]["arguments"],
+            {"code": "import math\nmath.gcd(65, 102)\n"},
+        )
+
+    def test_json_tool_arguments_are_parsed(self):
+        messages = [
+            {"role": "user", "content": "Compute gcd."},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "python",
+                            "arguments": "{\"code\": \"math.gcd(65, 102)\"}",
+                        },
+                    }
+                ],
+            },
+        ]
+
+        normalized = open_instruct.dataset_transformation.normalize_qwen_messages(messages)
+
+        self.assertEqual(
+            normalized[1]["tool_calls"][0]["function"]["arguments"],
+            {"code": "math.gcd(65, 102)"},
+        )
+
+
 class TestCachedDataset(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
