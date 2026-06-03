@@ -71,6 +71,18 @@ logger = logger_utils.setup_logger(__name__)
 
 # ----------------------------------------------------------------------------
 # Utilities
+TRUE_ENV_VALUES = {"1", "true", "yes", "y", "on"}
+QWEN_USE_ENVIRONMENT_ROLE_ENVS = ("OLMO_QWEN_USE_ENVIRONMENT_ROLE", "OPEN_INSTRUCT_QWEN_USE_ENVIRONMENT_ROLE")
+
+
+def env_flag_enabled(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in TRUE_ENV_VALUES
+
+
+def qwen_use_environment_role() -> bool:
+    return any(env_flag_enabled(name) for name in QWEN_USE_ENVIRONMENT_ROLE_ENVS)
+
+
 def get_commit_hash(
     model_name_or_path: str, revision: str, filename: str = "config.json", repo_type: str = "model"
 ) -> str | None:
@@ -998,8 +1010,8 @@ ENV_CONFIG_KEY = "env_config"
 EMPTY_DATASET_STATISTICS = {"per_dataset_stats": [], "dataset_order": []}
 
 # Cache version: increment this when transformation logic changes significantly
-# to invalidate old caches. v7: Added Qwen full-message SFT tokenization with optional tools.
-DATASET_CACHE_VERSION = "v7"
+# to invalidate old caches. v8: Added env-gated preservation of environment roles for Qwen transforms.
+DATASET_CACHE_VERSION = "v8"
 
 
 def _normalize_env_config_column(row: dict[str, Any]) -> None:
@@ -1314,16 +1326,20 @@ def normalize_qwen_messages(messages: Any, sft_messages_key: str = DEFAULT_SFT_M
     if not isinstance(messages, list) or not messages:
         raise ValueError(f"{sft_messages_key} must be a non-empty list for Qwen message tokenization.")
     normalized: list[dict[str, Any]] = []
+    allowed_roles = {"system", "user", "assistant", "tool"}
+    preserve_environment_role = qwen_use_environment_role()
+    if preserve_environment_role:
+        allowed_roles.add("environment")
     for message_idx, message in enumerate(messages):
         if not isinstance(message, dict):
             raise ValueError(f"{sft_messages_key}[{message_idx}] must be an object, got {type(message).__name__}.")
         normalized_message = dict(message)
         role = normalized_message.get("role")
-        if role == "environment":
+        if role == "environment" and not preserve_environment_role:
             role = "tool"
             normalized_message["role"] = role
-        if role not in {"system", "user", "assistant", "tool"}:
-            raise ValueError(f"{sft_messages_key}[{message_idx}] has unsupported TIR role: {role!r}.")
+        if role not in allowed_roles:
+            raise ValueError(f"{sft_messages_key}[{message_idx}] has unsupported Qwen message role: {role!r}.")
 
         if role == "assistant":
             if normalized_message.get("reasoning_content") is None and normalized_message.get("reasoning") is not None:
