@@ -122,7 +122,7 @@ APPLY_CHAT_TEMPLATE_EXAMPLE_PER_SECOND_PER_CPU = 400
 FILTER_EXAMPLE_PER_SECOND_PER_CPU = 1130
 DEFAULT_DATASET_MAP_BATCH_SIZE = 4
 DATASET_MAP_BATCH_SIZE_ENV = "OPEN_INSTRUCT_DATASET_MAP_BATCH_SIZE"
-DEFAULT_QWEN_BATCH_TOKENIZE_THREADS = 8
+DEFAULT_QWEN_BATCH_TOKENIZE_THREADS = 1
 QWEN_BATCH_TOKENIZE_THREADS_ENV = "OPEN_INSTRUCT_QWEN_BATCH_TOKENIZE_THREADS"
 
 
@@ -1960,12 +1960,14 @@ class DatasetConfig:
         if os.path.exists(self.dataset_name) and self.dataset_name.endswith(".jsonl"):
             assert self.dataset_split == "train", "Only train split is supported for local jsonl files."
             dataset = load_dataset(
-                "json", data_files=self.dataset_name, split=self.dataset_split, num_proc=max_num_processes()
+                "json", data_files=self.dataset_name, split=self.dataset_split, num_proc=max_num_processes(),
+                keep_in_memory=True
             )
         elif os.path.exists(self.dataset_name) and self.dataset_name.endswith(".parquet"):
             assert self.dataset_split == "train", "Only train split is supported for local parquet files."
             dataset = load_dataset(
-                "parquet", data_files=self.dataset_name, split=self.dataset_split, num_proc=max_num_processes()
+                "parquet", data_files=self.dataset_name, split=self.dataset_split, num_proc=max_num_processes(),
+                keep_in_memory=True
             )
         else:
             # commit hash only works for hf datasets
