@@ -73,7 +73,9 @@ logger = logger_utils.setup_logger(__name__)
 # ----------------------------------------------------------------------------
 # Utilities
 TRUE_ENV_VALUES = {"1", "true", "yes", "y", "on"}
+FALSE_ENV_VALUES = {"0", "false", "no", "n", "off"}
 QWEN_USE_ENVIRONMENT_ROLE_ENVS = ("OLMO_QWEN_USE_ENVIRONMENT_ROLE", "OPEN_INSTRUCT_QWEN_USE_ENVIRONMENT_ROLE")
+QWEN_FAST_CHAR_MASK_ENV = "OPEN_INSTRUCT_QWEN_FAST_CHAR_MASK"
 
 
 def env_flag_enabled(name: str) -> bool:
@@ -82,6 +84,13 @@ def env_flag_enabled(name: str) -> bool:
 
 def qwen_use_environment_role() -> bool:
     return any(env_flag_enabled(name) for name in QWEN_USE_ENVIRONMENT_ROLE_ENVS)
+
+
+def qwen_fast_char_mask_enabled() -> bool:
+    raw_value = os.environ.get(QWEN_FAST_CHAR_MASK_ENV)
+    if raw_value is None:
+        return True
+    return raw_value.strip().lower() not in FALSE_ENV_VALUES
 
 
 def get_commit_hash(
@@ -1417,7 +1426,83 @@ def normalize_qwen_messages(messages: Any, sft_messages_key: str = DEFAULT_SFT_M
     return normalized
 
 
-def sft_qwen_messages_tokenize_and_truncate_v1(
+def _qwen_chat_template_kwargs(
+    messages: list[dict[str, Any]],
+    max_seq_length: int,
+    tools: list[dict[str, Any]] | None,
+    *,
+    tokenize: bool,
+    return_tensors: str | None = None,
+    return_dict: bool = False,
+    add_generation_prompt: bool = False,
+) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "conversation": messages,
+        "tokenize": tokenize,
+        "return_dict": return_dict,
+        "padding": False,
+        "truncation": max_seq_length is not None,
+        "max_length": max_seq_length,
+        "add_generation_prompt": add_generation_prompt,
+    }
+    if return_tensors is not None:
+        kwargs["return_tensors"] = return_tensors
+    if tools is not None:
+        kwargs["tools"] = tools
+    return kwargs
+
+
+def qwen_labels_from_rendered_assistant_spans(
+    input_ids: list[int],
+    offsets: list[tuple[int, int]],
+    rendered_text: str,
+) -> list[int]:
+    """Build Qwen labels from assistant spans without re-tokenizing prefixes."""
+    labels = [MASKED_TOKEN_VALUE] * len(input_ids)
+    assistant_spans: list[tuple[int, int]] = []
+    assistant_header = "<|im_start|>assistant\n"
+    im_end = "<|im_end|>"
+    think_prefix = "<think>\n"
+    search_pos = 0
+    while True:
+        header_start = rendered_text.find(assistant_header, search_pos)
+        if header_start < 0:
+            break
+        span_start = header_start + len(assistant_header)
+        # Qwen generation prompts mask the assistant header and opening think
+        # marker. Preserve that behavior so this path matches prefix masking.
+        if rendered_text.startswith(think_prefix, span_start):
+            span_start += len(think_prefix)
+            if rendered_text.startswith("\n</think>", span_start):
+                span_start += 1
+        span_end_start = rendered_text.find(im_end, span_start)
+        if span_end_start < 0:
+            break
+        span_end = span_end_start + len(im_end)
+        if span_end < len(rendered_text) and rendered_text[span_end : span_end + 1] == "\n":
+            span_end += 1
+        if span_end > span_start:
+            assistant_spans.append((span_start, span_end))
+        search_pos = span_end
+
+    if not assistant_spans:
+        return labels
+
+    span_idx = 0
+    for token_idx, (token_start, token_end) in enumerate(offsets):
+        if token_end <= token_start:
+            continue
+        while span_idx < len(assistant_spans) and token_start >= assistant_spans[span_idx][1]:
+            span_idx += 1
+        if span_idx >= len(assistant_spans):
+            break
+        span_start, span_end = assistant_spans[span_idx]
+        if token_start < span_end and token_end > span_start:
+            labels[token_idx] = input_ids[token_idx]
+    return labels
+
+
+def sft_qwen_messages_tokenize_and_truncate_fast_v1(
     row: dict[str, Any],
     tokenizer: PreTrainedTokenizer,
     max_seq_length: int,
@@ -1426,20 +1511,61 @@ def sft_qwen_messages_tokenize_and_truncate_v1(
 ):
     messages = normalize_qwen_messages(row[sft_messages_key], sft_messages_key)
     tools = normalize_optional_tool_schema(row.get(tool_schema_key), tool_schema_key)
-    chat_template_kwargs = {
-        "conversation": messages,
-        "tokenize": True,
-        "return_tensors": "pt",
-        "return_dict": False,
-        "padding": False,
-        "truncation": True,
-        "max_length": max_seq_length,
-        "add_generation_prompt": False,
-    }
-    if tools is not None:
-        chat_template_kwargs["tools"] = tools
+    rendered = tokenizer.apply_chat_template(
+        **_qwen_chat_template_kwargs(
+            messages,
+            max_seq_length,
+            tools,
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+    )
+    encoded = tokenizer(
+        rendered,
+        add_special_tokens=False,
+        padding=False,
+        truncation=True,
+        max_length=max_seq_length,
+        return_attention_mask=True,
+        return_offsets_mapping=True,
+    )
+    input_ids = list(encoded[INPUT_IDS_KEY])
+    offsets = encoded["offset_mapping"]
+    labels = qwen_labels_from_rendered_assistant_spans(input_ids, offsets, rendered)
+    row[INPUT_IDS_KEY] = input_ids
+    row[LABELS_KEY] = labels
+    row[ATTENTION_MASK_KEY] = list(encoded[ATTENTION_MASK_KEY])
+    return row
+
+
+def sft_qwen_messages_tokenize_and_truncate_v1(
+    row: dict[str, Any],
+    tokenizer: PreTrainedTokenizer,
+    max_seq_length: int,
+    sft_messages_key: str = DEFAULT_SFT_MESSAGES_KEY,
+    tool_schema_key: str = TOOL_SCHEMA_COLUMN_KEY,
+):
+    if qwen_fast_char_mask_enabled():
+        return sft_qwen_messages_tokenize_and_truncate_fast_v1(
+            row=row,
+            tokenizer=tokenizer,
+            max_seq_length=max_seq_length,
+            sft_messages_key=sft_messages_key,
+            tool_schema_key=tool_schema_key,
+        )
+
+    messages = normalize_qwen_messages(row[sft_messages_key], sft_messages_key)
+    tools = normalize_optional_tool_schema(row.get(tool_schema_key), tool_schema_key)
     input_ids_result = tokenizer.apply_chat_template(
-        **chat_template_kwargs,
+        **_qwen_chat_template_kwargs(
+            messages,
+            max_seq_length,
+            tools,
+            tokenize=True,
+            return_tensors="pt",
+            return_dict=False,
+            add_generation_prompt=False,
+        )
     )
     assert isinstance(input_ids_result, torch.Tensor)
     input_ids = input_ids_result
