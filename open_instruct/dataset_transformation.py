@@ -49,6 +49,7 @@ import json
 import multiprocessing
 import os
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from functools import cached_property
 from typing import Any, Literal
@@ -121,6 +122,8 @@ APPLY_CHAT_TEMPLATE_EXAMPLE_PER_SECOND_PER_CPU = 400
 FILTER_EXAMPLE_PER_SECOND_PER_CPU = 1130
 DEFAULT_DATASET_MAP_BATCH_SIZE = 4
 DATASET_MAP_BATCH_SIZE_ENV = "OPEN_INSTRUCT_DATASET_MAP_BATCH_SIZE"
+DEFAULT_QWEN_BATCH_TOKENIZE_THREADS = 8
+QWEN_BATCH_TOKENIZE_THREADS_ENV = "OPEN_INSTRUCT_QWEN_BATCH_TOKENIZE_THREADS"
 
 
 def get_num_proc(dataset_len: int, num_available_cpus: int, example_per_second_per_cpu) -> int:
@@ -140,6 +143,21 @@ def get_dataset_map_batch_size() -> int:
             DEFAULT_DATASET_MAP_BATCH_SIZE,
         )
         return DEFAULT_DATASET_MAP_BATCH_SIZE
+
+
+def get_qwen_batch_tokenize_threads(batch_size: int) -> int:
+    raw_value = os.environ.get(QWEN_BATCH_TOKENIZE_THREADS_ENV, str(DEFAULT_QWEN_BATCH_TOKENIZE_THREADS))
+    try:
+        threads = max(1, int(float(raw_value)))
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r; using %d.",
+            QWEN_BATCH_TOKENIZE_THREADS_ENV,
+            raw_value,
+            DEFAULT_QWEN_BATCH_TOKENIZE_THREADS,
+        )
+        threads = DEFAULT_QWEN_BATCH_TOKENIZE_THREADS
+    return min(threads, max(1, batch_size))
 
 
 COLORS = ["on red", "on green", "on blue", "on yellow", "on magenta"]
@@ -1462,12 +1480,9 @@ def sft_qwen_messages_tokenize_and_truncate_batched_v1(
 ):
     batch_size = len(batch[sft_messages_key])
     tool_schema_values = batch.get(tool_schema_key)
-    output = {
-        INPUT_IDS_KEY: [],
-        LABELS_KEY: [],
-        ATTENTION_MASK_KEY: [],
-    }
-    for idx in range(batch_size):
+    num_threads = get_qwen_batch_tokenize_threads(batch_size)
+
+    def tokenize_one(idx: int) -> tuple[list[int], list[int], list[int]]:
         row = {
             sft_messages_key: batch[sft_messages_key][idx],
         }
@@ -1480,9 +1495,23 @@ def sft_qwen_messages_tokenize_and_truncate_batched_v1(
             sft_messages_key=sft_messages_key,
             tool_schema_key=tool_schema_key,
         )
-        output[INPUT_IDS_KEY].append(_flatten_token_value_to_list(tokenized[INPUT_IDS_KEY]))
-        output[LABELS_KEY].append(_flatten_token_value_to_list(tokenized[LABELS_KEY]))
-        output[ATTENTION_MASK_KEY].append(_flatten_token_value_to_list(tokenized[ATTENTION_MASK_KEY]))
+        return (
+            _flatten_token_value_to_list(tokenized[INPUT_IDS_KEY]),
+            _flatten_token_value_to_list(tokenized[LABELS_KEY]),
+            _flatten_token_value_to_list(tokenized[ATTENTION_MASK_KEY]),
+        )
+
+    if num_threads == 1:
+        tokenized_rows = [tokenize_one(idx) for idx in range(batch_size)]
+    else:
+        with ThreadPoolExecutor(max_workers=num_threads) as executor:
+            tokenized_rows = list(executor.map(tokenize_one, range(batch_size)))
+
+    output = {
+        INPUT_IDS_KEY: [input_ids for input_ids, _labels, _attention_mask in tokenized_rows],
+        LABELS_KEY: [labels for _input_ids, labels, _attention_mask in tokenized_rows],
+        ATTENTION_MASK_KEY: [attention_mask for _input_ids, _labels, attention_mask in tokenized_rows],
+    }
     return output
 
 
