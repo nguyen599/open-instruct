@@ -14,6 +14,7 @@ import os
 import pathlib
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any, Literal
 
@@ -440,66 +441,91 @@ def _convert_local_parquet_to_numpy_sft_polars(
         if args.get("max_seq_length") is not None:
             max_length = args["max_seq_length"]
             break
+    tokenize_workers = dataset_transformation.get_qwen_batch_tokenize_threads(total_raw_rows)
+    tokenize_window_size = max(1, min(batch_size, tokenize_workers * 4))
+    logger.info(
+        "Polars tokenization parallelism: workers=%d window_size=%d requested_batch_size=%d",
+        tokenize_workers,
+        tokenize_window_size,
+        batch_size,
+    )
+
+    def tokenize_polars_row(row: dict[str, Any]) -> tuple[dict[str, Any], list[int], np.ndarray, list[int]]:
+        tokenized_row = {
+            dataset_transformation.DEFAULT_SFT_MESSAGES_KEY: row[dataset_transformation.DEFAULT_SFT_MESSAGES_KEY],
+        }
+        if dataset_transformation.TOOL_SCHEMA_COLUMN_KEY in row:
+            tokenized_row[dataset_transformation.TOOL_SCHEMA_COLUMN_KEY] = row.get(
+                dataset_transformation.TOOL_SCHEMA_COLUMN_KEY
+            )
+        tokenized = dataset_transformation.sft_qwen_messages_tokenize_and_truncate_v1(
+            row=tokenized_row,
+            tokenizer=tc.tokenizer,
+            max_seq_length=max_length,
+        )
+        sample_tokens = dataset_transformation._flatten_token_value_to_list(
+            tokenized[dataset_transformation.INPUT_IDS_KEY]
+        )
+        sample_labels = dataset_transformation._flatten_token_value_to_list(tokenized[dataset_transformation.LABELS_KEY])
+        sample_attention = dataset_transformation._flatten_token_value_to_list(
+            tokenized[dataset_transformation.ATTENTION_MASK_KEY]
+        )
+        labels_mask = (np.asarray(sample_labels) != dataset_transformation.MASKED_TOKEN_VALUE).astype(np.uint8)
+        return row, sample_tokens, labels_mask, sample_attention
 
     with (
         tokens_path.open("ab") as tokens_fh,
         labels_path.open("ab") as labels_fh,
         boundaries_path.open("ab") as boundaries_fh,
     ):
-        for start in range(0, total_raw_rows, batch_size):
-            raw_batch = rows[start : start + batch_size]
-            tokenized = dataset_transformation.sft_qwen_messages_tokenize_and_truncate_batched_v1(
-                batch={
-                    dataset_transformation.DEFAULT_SFT_MESSAGES_KEY: [
-                        row[dataset_transformation.DEFAULT_SFT_MESSAGES_KEY] for row in raw_batch
-                    ],
-                    dataset_transformation.TOOL_SCHEMA_COLUMN_KEY: [
-                        row.get(dataset_transformation.TOOL_SCHEMA_COLUMN_KEY) for row in raw_batch
-                    ],
-                },
-                tokenizer=tc.tokenizer,
-                max_seq_length=max_length,
-            )
-            for row, sample_tokens, sample_labels, sample_attention in zip(
-                raw_batch,
-                tokenized[dataset_transformation.INPUT_IDS_KEY],
-                tokenized[dataset_transformation.LABELS_KEY],
-                tokenized[dataset_transformation.ATTENTION_MASK_KEY],
-            ):
-                labels_arr = np.asarray(sample_labels)
-                labels_mask = (labels_arr != dataset_transformation.MASKED_TOKEN_VALUE).astype(np.uint8)
-                if int(labels_mask.sum()) == 0:
-                    continue
+        with ThreadPoolExecutor(max_workers=tokenize_workers) as executor:
+            for start in range(0, total_raw_rows, tokenize_window_size):
+                raw_batch = rows[start : start + tokenize_window_size]
+                futures = {
+                    executor.submit(tokenize_polars_row, row): batch_idx for batch_idx, row in enumerate(raw_batch)
+                }
+                tokenized_batch: list[tuple[dict[str, Any], list[int], np.ndarray, list[int]] | None] = [
+                    None
+                ] * len(raw_batch)
+                for future in as_completed(futures):
+                    tokenized_batch[futures[future]] = future.result()
+                    progress.update(1)
+                    now = time.perf_counter()
+                    if now - last_description_update >= 30.0:
+                        utils.maybe_update_beaker_description(
+                            current_step=progress.n,
+                            total_steps=total_raw_rows,
+                            start_time=collect_start,
+                        )
+                        last_description_update = now
 
-                valid_sample_idx += 1
-                source = row[dataset_transformation.DATASET_ORIGIN_KEY]
-                valid_sources.append(source)
-                if valid_sample_idx < start_idx:
-                    continue
+                for item in tokenized_batch:
+                    if item is None:
+                        continue
+                    row, sample_tokens, labels_mask, sample_attention = item
+                    if int(labels_mask.sum()) == 0:
+                        continue
 
-                sample_length = len(sample_tokens)
-                tokens_arr = np.asarray(sample_tokens, dtype=token_dtype)
-                attention_arr = np.asarray(sample_attention)
-                assert (attention_arr == 1).all(), (
-                    f"Expected all attention mask values to be 1, but found: {attention_arr}"
-                )
-                tokens_arr.tofile(tokens_fh)
-                labels_mask.tofile(labels_fh)
-                np.array([current_position, current_position + sample_length], dtype=_BOUNDARIES_DTYPE).tofile(
-                    boundaries_fh
-                )
-                current_position += sample_length
+                    valid_sample_idx += 1
+                    source = row[dataset_transformation.DATASET_ORIGIN_KEY]
+                    valid_sources.append(source)
+                    if valid_sample_idx < start_idx:
+                        continue
 
-            progress.update(len(raw_batch))
-            _flush_partial_files(tokens_fh, labels_fh, boundaries_fh)
-            now = time.perf_counter()
-            if now - last_description_update >= 30.0:
-                utils.maybe_update_beaker_description(
-                    current_step=min(start + len(raw_batch), total_raw_rows),
-                    total_steps=total_raw_rows,
-                    start_time=collect_start,
-                )
-                last_description_update = now
+                    sample_length = len(sample_tokens)
+                    tokens_arr = np.asarray(sample_tokens, dtype=token_dtype)
+                    attention_arr = np.asarray(sample_attention)
+                    assert (attention_arr == 1).all(), (
+                        f"Expected all attention mask values to be 1, but found: {attention_arr}"
+                    )
+                    tokens_arr.tofile(tokens_fh)
+                    labels_mask.tofile(labels_fh)
+                    np.array([current_position, current_position + sample_length], dtype=_BOUNDARIES_DTYPE).tofile(
+                        boundaries_fh
+                    )
+                    current_position += sample_length
+
+                _flush_partial_files(tokens_fh, labels_fh, boundaries_fh)
 
     progress.close()
     utils.maybe_update_beaker_description(current_step=total_raw_rows, total_steps=total_raw_rows, start_time=collect_start)
