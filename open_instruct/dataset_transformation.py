@@ -119,11 +119,27 @@ def _preserve_column(column_name: str, dataset, target_columns: list) -> list:
 # Performance tuning. Some rough numbers:
 APPLY_CHAT_TEMPLATE_EXAMPLE_PER_SECOND_PER_CPU = 400
 FILTER_EXAMPLE_PER_SECOND_PER_CPU = 1130
+DEFAULT_DATASET_MAP_BATCH_SIZE = 4
+DATASET_MAP_BATCH_SIZE_ENV = "OPEN_INSTRUCT_DATASET_MAP_BATCH_SIZE"
 
 
 def get_num_proc(dataset_len: int, num_available_cpus: int, example_per_second_per_cpu) -> int:
     num_required_cpus = max(1, dataset_len // example_per_second_per_cpu)
     return min(num_required_cpus, num_available_cpus, dataset_len)
+
+
+def get_dataset_map_batch_size() -> int:
+    raw_value = os.environ.get(DATASET_MAP_BATCH_SIZE_ENV, str(DEFAULT_DATASET_MAP_BATCH_SIZE))
+    try:
+        return max(1, int(float(raw_value)))
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r; using %d.",
+            DATASET_MAP_BATCH_SIZE_ENV,
+            raw_value,
+            DEFAULT_DATASET_MAP_BATCH_SIZE,
+        )
+        return DEFAULT_DATASET_MAP_BATCH_SIZE
 
 
 COLORS = ["on red", "on green", "on blue", "on yellow", "on magenta"]
@@ -1010,8 +1026,8 @@ ENV_CONFIG_KEY = "env_config"
 EMPTY_DATASET_STATISTICS = {"per_dataset_stats": [], "dataset_order": []}
 
 # Cache version: increment this when transformation logic changes significantly
-# to invalidate old caches. v8: Added env-gated preservation of environment roles for Qwen transforms.
-DATASET_CACHE_VERSION = "v8"
+# to invalidate old caches. v9: Batched Qwen tokenization and source-column fast path.
+DATASET_CACHE_VERSION = "v9"
 
 
 def _normalize_env_config_column(row: dict[str, Any]) -> None:
@@ -1425,6 +1441,51 @@ def sft_qwen_messages_tokenize_and_truncate_v1(
     return row
 
 
+def _flatten_token_value_to_list(value: Any) -> list[int]:
+    if hasattr(value, "detach"):
+        value = value.detach().cpu()
+    if hasattr(value, "flatten"):
+        value = value.flatten()
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if isinstance(value, list):
+        return value
+    return list(value)
+
+
+def sft_qwen_messages_tokenize_and_truncate_batched_v1(
+    batch: dict[str, list[Any]],
+    tokenizer: PreTrainedTokenizer,
+    max_seq_length: int,
+    sft_messages_key: str = DEFAULT_SFT_MESSAGES_KEY,
+    tool_schema_key: str = TOOL_SCHEMA_COLUMN_KEY,
+):
+    batch_size = len(batch[sft_messages_key])
+    tool_schema_values = batch.get(tool_schema_key)
+    output = {
+        INPUT_IDS_KEY: [],
+        LABELS_KEY: [],
+        ATTENTION_MASK_KEY: [],
+    }
+    for idx in range(batch_size):
+        row = {
+            sft_messages_key: batch[sft_messages_key][idx],
+        }
+        if tool_schema_values is not None:
+            row[tool_schema_key] = tool_schema_values[idx]
+        tokenized = sft_qwen_messages_tokenize_and_truncate_v1(
+            row=row,
+            tokenizer=tokenizer,
+            max_seq_length=max_seq_length,
+            sft_messages_key=sft_messages_key,
+            tool_schema_key=tool_schema_key,
+        )
+        output[INPUT_IDS_KEY].append(_flatten_token_value_to_list(tokenized[INPUT_IDS_KEY]))
+        output[LABELS_KEY].append(_flatten_token_value_to_list(tokenized[LABELS_KEY]))
+        output[ATTENTION_MASK_KEY].append(_flatten_token_value_to_list(tokenized[ATTENTION_MASK_KEY]))
+    return output
+
+
 def normalize_tir_tool_schema(value: Any, field_name: str = TOOL_SCHEMA_COLUMN_KEY) -> list[dict[str, Any]]:
     tools = normalize_optional_tool_schema(value, field_name)
     if tools is None:
@@ -1790,6 +1851,10 @@ TRANSFORM_FNS = {
     "sft_filter_v1": (sft_filter_v1, "filter"),
     "sft_tulu_tokenize_and_truncate_v1": (sft_tulu_tokenize_and_truncate_v1, "map"),
     "sft_qwen_messages_tokenize_and_truncate_v1": (sft_qwen_messages_tokenize_and_truncate_v1, "map"),
+    "sft_qwen_messages_tokenize_and_truncate_batched_v1": (
+        sft_qwen_messages_tokenize_and_truncate_batched_v1,
+        "batched_map",
+    ),
     "sft_tir_tokenize_and_truncate_v1": (sft_tir_tokenize_and_truncate_v1, "map"),
     "sft_tulu_filter_v1": (sft_tulu_filter_v1, "filter"),
     "preference_tokenize_v1": (preference_tokenize_v1, "map"),
@@ -1946,21 +2011,33 @@ def get_dataset_v1(dc: DatasetConfig, tc: TokenizerConfig):
     chat_template_hash = hashlib.sha256(chat_template_str.encode()).hexdigest()[:16]
     tokenizer_files_hash = json.dumps(tc.tokenizer_files_hash, sort_keys=True)
 
-    # Add dataset source field to track origin after shuffling
-    dataset = dataset.map(
-        lambda example: {**example, DATASET_ORIGIN_KEY: dc.dataset_name},
-        num_proc=num_proc,
-        desc=f"Adding dataset source field for {dc.dataset_name}",
+    # Add dataset source field to track origin after shuffling. This is a constant
+    # column, so avoid a full multiprocessing map over every row.
+    if DATASET_ORIGIN_KEY in dataset.column_names:
+        dataset = dataset.remove_columns(DATASET_ORIGIN_KEY)
+    logger.info(
+        "Adding dataset source column for %s with add_column (%d rows).",
+        dc.dataset_name,
+        len(dataset),
     )
+    dataset = dataset.add_column(DATASET_ORIGIN_KEY, [dc.dataset_name] * len(dataset))
 
     # Normalize env_config before tokenization so downstream always sees canonical payloads.
     if ENV_CONFIG_KEY in dataset.column_names:
         env_config_fingerprint = hashlib.sha256(
             f"{DATASET_CACHE_VERSION}:normalize_env_config:{dataset._fingerprint}".encode()
         ).hexdigest()[:16]
+        selected_num_proc = get_num_proc(len(dataset), num_proc, APPLY_CHAT_TEMPLATE_EXAMPLE_PER_SECOND_PER_CPU)
+        logger.info(
+            "Normalizing %s: rows=%d requested_num_proc=%d selected_num_proc=%d",
+            ENV_CONFIG_KEY,
+            len(dataset),
+            num_proc,
+            selected_num_proc,
+        )
         dataset = dataset.map(
             _normalize_env_config_row,
-            num_proc=get_num_proc(len(dataset), num_proc, APPLY_CHAT_TEMPLATE_EXAMPLE_PER_SECOND_PER_CPU),
+            num_proc=selected_num_proc,
             new_fingerprint=env_config_fingerprint,
             desc=f"Normalizing {ENV_CONFIG_KEY} for {dc.dataset_name}",
         )
@@ -1990,19 +2067,61 @@ def get_dataset_v1(dc: DatasetConfig, tc: TokenizerConfig):
         target_columns = _preserve_column(ENV_CONFIG_KEY, dataset, target_columns)
 
         if fn_type == "map":
+            selected_num_proc = get_num_proc(len(dataset), num_proc, APPLY_CHAT_TEMPLATE_EXAMPLE_PER_SECOND_PER_CPU)
+            logger.info(
+                "Applying dataset transform %s (%s): rows=%d requested_num_proc=%d selected_num_proc=%d",
+                fn_name,
+                fn_type,
+                len(dataset),
+                num_proc,
+                selected_num_proc,
+            )
             dataset = dataset.map(
                 fn,
                 fn_kwargs=fn_kwargs,
                 remove_columns=[col for col in dataset.column_names if col not in target_columns],
-                num_proc=get_num_proc(len(dataset), num_proc, APPLY_CHAT_TEMPLATE_EXAMPLE_PER_SECOND_PER_CPU),
+                num_proc=selected_num_proc,
                 new_fingerprint=new_fingerprint,
+                desc=f"{fn_name} for {dc.dataset_name}",
+            )
+        elif fn_type == "batched_map":
+            selected_num_proc = get_num_proc(len(dataset), num_proc, APPLY_CHAT_TEMPLATE_EXAMPLE_PER_SECOND_PER_CPU)
+            batch_size = get_dataset_map_batch_size()
+            logger.info(
+                "Applying dataset transform %s (%s): rows=%d requested_num_proc=%d selected_num_proc=%d batch_size=%d",
+                fn_name,
+                fn_type,
+                len(dataset),
+                num_proc,
+                selected_num_proc,
+                batch_size,
+            )
+            dataset = dataset.map(
+                fn,
+                batched=True,
+                batch_size=batch_size,
+                fn_kwargs=fn_kwargs,
+                remove_columns=[col for col in dataset.column_names if col not in target_columns],
+                num_proc=selected_num_proc,
+                new_fingerprint=new_fingerprint,
+                desc=f"{fn_name} for {dc.dataset_name}",
             )
         elif fn_type == "filter":
+            selected_num_proc = get_num_proc(len(dataset), num_proc, FILTER_EXAMPLE_PER_SECOND_PER_CPU)
+            logger.info(
+                "Applying dataset transform %s (%s): rows=%d requested_num_proc=%d selected_num_proc=%d",
+                fn_name,
+                fn_type,
+                len(dataset),
+                num_proc,
+                selected_num_proc,
+            )
             dataset = dataset.filter(
                 fn,
                 fn_kwargs=fn_kwargs,
-                num_proc=get_num_proc(len(dataset), num_proc, FILTER_EXAMPLE_PER_SECOND_PER_CPU),
+                num_proc=selected_num_proc,
                 new_fingerprint=new_fingerprint,
+                desc=f"{fn_name} for {dc.dataset_name}",
             )
         # NOTE: elif we can implement packing here to create a packed SFT dataset. Low priority for now.
         else:
@@ -2196,6 +2315,7 @@ class LocalDatasetTransformationCache:
                 return dataset, EMPTY_DATASET_STATISTICS.copy()
 
         print("Cache not found or invalid, transforming datasets...")
+        num_proc = int(float(os.environ.get("BEAKER_ASSIGNED_CPU_COUNT", multiprocessing.cpu_count())))
 
         # Transform each dataset and collect statistics
         transformed_datasets = []
@@ -2229,12 +2349,31 @@ class LocalDatasetTransformationCache:
                 total_tokens = 0
                 trainable_tokens = 0
 
-                def count_tokens(sample):
-                    token_count = len(sample[INPUT_IDS_KEY])
-                    trainable_tokens = sum(1 for label in sample[LABELS_KEY] if label != MASKED_TOKEN_VALUE)
-                    return {"token_count": token_count, "label_token_count": trainable_tokens}
+                def count_tokens(batch):
+                    return {
+                        "token_count": [len(input_ids) for input_ids in batch[INPUT_IDS_KEY]],
+                        "label_token_count": [
+                            sum(1 for label in labels if label != MASKED_TOKEN_VALUE) for labels in batch[LABELS_KEY]
+                        ],
+                    }
 
-                token_count_dataset = dataset.map(count_tokens, batched=False)
+                stats_num_proc = get_num_proc(len(dataset), num_proc, FILTER_EXAMPLE_PER_SECOND_PER_CPU)
+                stats_batch_size = get_dataset_map_batch_size()
+                logger.info(
+                    "Counting token statistics: rows=%d requested_num_proc=%d selected_num_proc=%d batch_size=%d",
+                    len(dataset),
+                    num_proc,
+                    stats_num_proc,
+                    stats_batch_size,
+                )
+                token_count_dataset = dataset.map(
+                    count_tokens,
+                    batched=True,
+                    batch_size=stats_batch_size,
+                    num_proc=stats_num_proc,
+                    remove_columns=dataset.column_names,
+                    desc="Counting token statistics",
+                )
                 total_tokens = sum(token_count_dataset["token_count"])
                 trainable_tokens = sum(token_count_dataset["label_token_count"])
                 stats["total_tokens"] = total_tokens
