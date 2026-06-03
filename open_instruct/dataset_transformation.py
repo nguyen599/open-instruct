@@ -780,10 +780,26 @@ def get_tokenizer_tulu_v2_1(tc: "TokenizerConfig"):
     return tokenizer
 
 
+def get_chat_template_from_model(tc: "TokenizerConfig") -> str:
+    if tc.chat_template_model is None:
+        raise ValueError("chat_template_model must be set")
+    template_tokenizer = AutoTokenizer.from_pretrained(
+        tc.chat_template_model,
+        trust_remote_code=tc.trust_remote_code,
+        use_fast=tc.use_fast,
+    )
+    chat_template = getattr(template_tokenizer, "chat_template", None)
+    if not chat_template:
+        raise ValueError(f"Could not find chat template for {tc.chat_template_model}.")
+    return chat_template
+
+
 def get_tokenizer_tulu_v2_2(tc: "TokenizerConfig"):
     # @vwxyzjn: "olmo" handles both `olmo2` and `olmoe`.
     if "olmo" in str(tc.tokenizer_name_or_path).lower():
-        if tc.chat_template_name is None:
+        if tc.chat_template_model is not None:
+            assert not tc.add_bos, "For copied modern chat templates, you must *not* run with `--add_bos`."
+        elif tc.chat_template_name is None:
             pass  # just assume the user knows what they're doing
         elif "olmo" in tc.chat_template_name:
             assert not tc.add_bos, "For newer OLMo chat templates, you must *not* run with `--add_bos`."
@@ -810,7 +826,7 @@ def get_tokenizer_tulu_v2_2(tc: "TokenizerConfig"):
             # OLMo newer models use this tokenizer
             if tokenizer.bos_token is None:
                 tokenizer.bos_token = tokenizer.eos_token
-                if tc.chat_template_name is None or "olmo" not in tc.chat_template_name:
+                if tc.chat_template_model is None and (tc.chat_template_name is None or "olmo" not in tc.chat_template_name):
                     assert tc.add_bos, (
                         "For OLMo with GPTNeoX, you must add bos token to the beginning of the input sequence "
                         "if using an older chat template."
@@ -835,7 +851,9 @@ def get_tokenizer_tulu_v2_2(tc: "TokenizerConfig"):
     # set the tokenizer chat template to the training format
     # this will be used for encoding the training examples
     # and saved together with the tokenizer to be used later.
-    if tc.chat_template_name in CHAT_TEMPLATES:
+    if tc.chat_template_model is not None:
+        tokenizer.chat_template = get_chat_template_from_model(tc)
+    elif tc.chat_template_name in CHAT_TEMPLATES:
         tokenizer.chat_template = CHAT_TEMPLATES[tc.chat_template_name]
     else:
         try:
@@ -866,6 +884,7 @@ GET_TOKENIZER_FN = {
 }
 
 DEFAULT_SFT_MESSAGES_KEY = "messages"
+TOOL_SCHEMA_COLUMN_KEY = "tool_schema"
 GROUND_TRUTHS_KEY = "ground_truth"
 VERIFIER_SOURCE_KEY = "dataset"
 RAW_PROMPT_KEY = "prompt"
@@ -878,6 +897,7 @@ class TokenizerConfig:
     trust_remote_code: bool = False
     use_fast: bool = True
     chat_template_name: str | None = None  # default to using the tokenizer chat template
+    chat_template_model: str | None = None  # copy only the chat template from this tokenizer/model
     add_bos: bool = False
     get_tokenizer_fn: str = "get_tokenizer_tulu_v2_2"
 
@@ -1152,6 +1172,7 @@ def mask_labels(
     tokenizer: PreTrainedTokenizer,
     max_seq_length: int,
     should_mask: Callable[[int, dict[str, Any], list[dict[str, Any]]], bool],
+    tools: list[dict[str, Any]] | None = None,
 ) -> None:
     """Mask spans in ``labels`` by setting them to -100.
 
@@ -1172,6 +1193,8 @@ def mask_labels(
         "truncation": max_seq_length is not None,
         "max_length": max_seq_length,
     }
+    if tools is not None:
+        chat_template_kwargs["tools"] = tools
 
     deferred_from_zero = False
     seen_user = False
@@ -1229,6 +1252,122 @@ def sft_tulu_tokenize_and_truncate_v1(row: dict[str, Any], tokenizer: PreTrained
     input_ids = input_ids_result
     labels = input_ids.clone()
     mask_labels(labels, messages, tokenizer, max_seq_length, lambda idx, msg, _msgs: msg["role"] != "assistant")
+    attention_mask = torch.ones_like(input_ids)
+    row[INPUT_IDS_KEY] = input_ids.flatten()
+    row[LABELS_KEY] = labels.flatten()
+    row[ATTENTION_MASK_KEY] = attention_mask.flatten()
+    return row
+
+
+def parse_json_column_value(value: Any, field_name: str) -> Any:
+    if not isinstance(value, str):
+        return value
+    stripped = value.strip()
+    if not stripped:
+        return None
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Could not parse {field_name} as JSON: {value[:200]!r}") from exc
+
+
+def normalize_tir_tool_schema(value: Any, field_name: str = TOOL_SCHEMA_COLUMN_KEY) -> list[dict[str, Any]]:
+    parsed = parse_json_column_value(value, field_name)
+    if isinstance(parsed, dict) and isinstance(parsed.get("tools"), list):
+        parsed = parsed["tools"]
+    elif isinstance(parsed, dict):
+        parsed = [parsed]
+    if not isinstance(parsed, list) or not parsed:
+        raise ValueError(f"{field_name} must be a non-empty tool schema list or JSON string.")
+    tools: list[dict[str, Any]] = []
+    for idx, tool in enumerate(parsed):
+        if not isinstance(tool, dict):
+            raise ValueError(f"{field_name}[{idx}] must be an object, got {type(tool).__name__}.")
+        tools.append(dict(tool))
+    return tools
+
+
+def normalize_tir_tool_call(tool_call: Any, message_idx: int, tool_call_idx: int) -> dict[str, Any]:
+    if not isinstance(tool_call, dict):
+        raise ValueError(
+            f"messages[{message_idx}].tool_calls[{tool_call_idx}] must be an object, got {type(tool_call).__name__}."
+        )
+    normalized = dict(tool_call)
+    function = normalized.get("function")
+    if isinstance(function, dict):
+        function = dict(function)
+        arguments = function.get("arguments")
+        if isinstance(arguments, str):
+            function["arguments"] = parse_json_column_value(
+                arguments,
+                f"messages[{message_idx}].tool_calls[{tool_call_idx}].function.arguments",
+            )
+        normalized["function"] = function
+    return normalized
+
+
+def normalize_tir_messages(messages: Any, sft_messages_key: str = DEFAULT_SFT_MESSAGES_KEY) -> list[dict[str, Any]]:
+    if not isinstance(messages, list) or not messages:
+        raise ValueError(f"{sft_messages_key} must be a non-empty list for TIR tokenization.")
+    normalized: list[dict[str, Any]] = []
+    for message_idx, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise ValueError(f"{sft_messages_key}[{message_idx}] must be an object, got {type(message).__name__}.")
+        normalized_message = dict(message)
+        role = normalized_message.get("role")
+        if role == "environment":
+            role = "tool"
+            normalized_message["role"] = role
+        if role not in {"system", "user", "assistant", "tool"}:
+            raise ValueError(f"{sft_messages_key}[{message_idx}] has unsupported TIR role: {role!r}.")
+
+        if role == "assistant":
+            if normalized_message.get("reasoning_content") is None and normalized_message.get("reasoning") is not None:
+                normalized_message["reasoning_content"] = normalized_message["reasoning"]
+            tool_calls = normalized_message.get("tool_calls")
+            if tool_calls is not None:
+                if not isinstance(tool_calls, list):
+                    raise ValueError(f"{sft_messages_key}[{message_idx}].tool_calls must be a list.")
+                normalized_message["tool_calls"] = [
+                    normalize_tir_tool_call(tool_call, message_idx, tool_call_idx)
+                    for tool_call_idx, tool_call in enumerate(tool_calls)
+                ]
+
+        normalized.append(normalized_message)
+    return normalized
+
+
+def sft_tir_tokenize_and_truncate_v1(
+    row: dict[str, Any],
+    tokenizer: PreTrainedTokenizer,
+    max_seq_length: int,
+    sft_messages_key: str = DEFAULT_SFT_MESSAGES_KEY,
+    tool_schema_key: str = TOOL_SCHEMA_COLUMN_KEY,
+):
+    messages = normalize_tir_messages(row[sft_messages_key], sft_messages_key)
+    tools = normalize_tir_tool_schema(row.get(tool_schema_key), tool_schema_key)
+    input_ids_result = tokenizer.apply_chat_template(
+        conversation=messages,
+        tools=tools,
+        tokenize=True,
+        return_tensors="pt",
+        return_dict=False,
+        padding=False,
+        truncation=True,
+        max_length=max_seq_length,
+        add_generation_prompt=False,
+    )
+    assert isinstance(input_ids_result, torch.Tensor)
+    input_ids = input_ids_result
+    labels = input_ids.clone()
+    mask_labels(
+        labels,
+        messages,
+        tokenizer,
+        max_seq_length,
+        lambda idx, msg, _msgs: msg["role"] != "assistant",
+        tools=tools,
+    )
     attention_mask = torch.ones_like(input_ids)
     row[INPUT_IDS_KEY] = input_ids.flatten()
     row[LABELS_KEY] = labels.flatten()
@@ -1573,6 +1712,7 @@ TRANSFORM_FNS = {
     "sft_tokenize_mask_out_prompt_v1": (sft_tokenize_mask_out_prompt_v1, "map"),
     "sft_filter_v1": (sft_filter_v1, "filter"),
     "sft_tulu_tokenize_and_truncate_v1": (sft_tulu_tokenize_and_truncate_v1, "map"),
+    "sft_tir_tokenize_and_truncate_v1": (sft_tir_tokenize_and_truncate_v1, "map"),
     "sft_tulu_filter_v1": (sft_tulu_filter_v1, "filter"),
     "preference_tokenize_v1": (preference_tokenize_v1, "map"),
     "preference_filter_v1": (preference_filter_v1, "filter"),

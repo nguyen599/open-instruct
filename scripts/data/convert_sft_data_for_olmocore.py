@@ -138,8 +138,9 @@ def main(args: ConvertSFTDataArguments, tc: dataset_transformation.TokenizerConf
             args.dataset_local_cache_dir = beaker_cache_dir
 
     transform_fn_args = []
+    max_length_transforms = {"sft_tulu_tokenize_and_truncate_v1", "sft_tir_tokenize_and_truncate_v1"}
     for fn_name in args.dataset_transform_fn:
-        if fn_name == "sft_tulu_tokenize_and_truncate_v1":
+        if fn_name in max_length_transforms:
             transform_fn_args.append({"max_seq_length": args.max_seq_length})
         else:
             transform_fn_args.append({})
