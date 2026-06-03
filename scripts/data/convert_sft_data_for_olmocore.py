@@ -91,7 +91,7 @@ class ConvertSFTDataArguments:
 
     """The list of transform functions to apply to the dataset."""
     dataset_transform_fn: list[str] = field(
-        default_factory=lambda: ["sft_tulu_tokenize_and_truncate_v1", "sft_tulu_filter_v1"]
+        default_factory=lambda: ["sft_qwen_messages_tokenize_and_truncate_v1", "sft_tulu_filter_v1"]
     )
 
     """The columns to use for the dataset."""
@@ -138,7 +138,11 @@ def main(args: ConvertSFTDataArguments, tc: dataset_transformation.TokenizerConf
             args.dataset_local_cache_dir = beaker_cache_dir
 
     transform_fn_args = []
-    max_length_transforms = {"sft_tulu_tokenize_and_truncate_v1", "sft_tir_tokenize_and_truncate_v1"}
+    max_length_transforms = {
+        "sft_tulu_tokenize_and_truncate_v1",
+        "sft_qwen_messages_tokenize_and_truncate_v1",
+        "sft_tir_tokenize_and_truncate_v1",
+    }
     for fn_name in args.dataset_transform_fn:
         if fn_name in max_length_transforms:
             transform_fn_args.append({"max_seq_length": args.max_seq_length})

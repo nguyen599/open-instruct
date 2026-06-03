@@ -998,8 +998,8 @@ ENV_CONFIG_KEY = "env_config"
 EMPTY_DATASET_STATISTICS = {"per_dataset_stats": [], "dataset_order": []}
 
 # Cache version: increment this when transformation logic changes significantly
-# to invalidate old caches. v6: Added return_dict=False to apply_chat_template calls for transformers 5.x.
-DATASET_CACHE_VERSION = "v6"
+# to invalidate old caches. v7: Added Qwen full-message SFT tokenization with optional tools.
+DATASET_CACHE_VERSION = "v7"
 
 
 def _normalize_env_config_column(row: dict[str, Any]) -> None:
@@ -1271,14 +1271,18 @@ def parse_json_column_value(value: Any, field_name: str) -> Any:
         raise ValueError(f"Could not parse {field_name} as JSON: {value[:200]!r}") from exc
 
 
-def normalize_tir_tool_schema(value: Any, field_name: str = TOOL_SCHEMA_COLUMN_KEY) -> list[dict[str, Any]]:
+def normalize_optional_tool_schema(value: Any, field_name: str = TOOL_SCHEMA_COLUMN_KEY) -> list[dict[str, Any]] | None:
     parsed = parse_json_column_value(value, field_name)
+    if parsed is None:
+        return None
     if isinstance(parsed, dict) and isinstance(parsed.get("tools"), list):
         parsed = parsed["tools"]
     elif isinstance(parsed, dict):
         parsed = [parsed]
-    if not isinstance(parsed, list) or not parsed:
-        raise ValueError(f"{field_name} must be a non-empty tool schema list or JSON string.")
+    if not isinstance(parsed, list):
+        raise ValueError(f"{field_name} must be a tool schema list/object or JSON string.")
+    if not parsed:
+        return None
     tools: list[dict[str, Any]] = []
     for idx, tool in enumerate(parsed):
         if not isinstance(tool, dict):
@@ -1287,7 +1291,7 @@ def normalize_tir_tool_schema(value: Any, field_name: str = TOOL_SCHEMA_COLUMN_K
     return tools
 
 
-def normalize_tir_tool_call(tool_call: Any, message_idx: int, tool_call_idx: int) -> dict[str, Any]:
+def normalize_qwen_tool_call(tool_call: Any, message_idx: int, tool_call_idx: int) -> dict[str, Any]:
     if not isinstance(tool_call, dict):
         raise ValueError(
             f"messages[{message_idx}].tool_calls[{tool_call_idx}] must be an object, got {type(tool_call).__name__}."
@@ -1306,9 +1310,9 @@ def normalize_tir_tool_call(tool_call: Any, message_idx: int, tool_call_idx: int
     return normalized
 
 
-def normalize_tir_messages(messages: Any, sft_messages_key: str = DEFAULT_SFT_MESSAGES_KEY) -> list[dict[str, Any]]:
+def normalize_qwen_messages(messages: Any, sft_messages_key: str = DEFAULT_SFT_MESSAGES_KEY) -> list[dict[str, Any]]:
     if not isinstance(messages, list) or not messages:
-        raise ValueError(f"{sft_messages_key} must be a non-empty list for TIR tokenization.")
+        raise ValueError(f"{sft_messages_key} must be a non-empty list for Qwen message tokenization.")
     normalized: list[dict[str, Any]] = []
     for message_idx, message in enumerate(messages):
         if not isinstance(message, dict):
@@ -1329,7 +1333,7 @@ def normalize_tir_messages(messages: Any, sft_messages_key: str = DEFAULT_SFT_ME
                 if not isinstance(tool_calls, list):
                     raise ValueError(f"{sft_messages_key}[{message_idx}].tool_calls must be a list.")
                 normalized_message["tool_calls"] = [
-                    normalize_tir_tool_call(tool_call, message_idx, tool_call_idx)
+                    normalize_qwen_tool_call(tool_call, message_idx, tool_call_idx)
                     for tool_call_idx, tool_call in enumerate(tool_calls)
                 ]
 
@@ -1337,25 +1341,29 @@ def normalize_tir_messages(messages: Any, sft_messages_key: str = DEFAULT_SFT_ME
     return normalized
 
 
-def sft_tir_tokenize_and_truncate_v1(
+def sft_qwen_messages_tokenize_and_truncate_v1(
     row: dict[str, Any],
     tokenizer: PreTrainedTokenizer,
     max_seq_length: int,
     sft_messages_key: str = DEFAULT_SFT_MESSAGES_KEY,
     tool_schema_key: str = TOOL_SCHEMA_COLUMN_KEY,
 ):
-    messages = normalize_tir_messages(row[sft_messages_key], sft_messages_key)
-    tools = normalize_tir_tool_schema(row.get(tool_schema_key), tool_schema_key)
+    messages = normalize_qwen_messages(row[sft_messages_key], sft_messages_key)
+    tools = normalize_optional_tool_schema(row.get(tool_schema_key), tool_schema_key)
+    chat_template_kwargs = {
+        "conversation": messages,
+        "tokenize": True,
+        "return_tensors": "pt",
+        "return_dict": False,
+        "padding": False,
+        "truncation": True,
+        "max_length": max_seq_length,
+        "add_generation_prompt": False,
+    }
+    if tools is not None:
+        chat_template_kwargs["tools"] = tools
     input_ids_result = tokenizer.apply_chat_template(
-        conversation=messages,
-        tools=tools,
-        tokenize=True,
-        return_tensors="pt",
-        return_dict=False,
-        padding=False,
-        truncation=True,
-        max_length=max_seq_length,
-        add_generation_prompt=False,
+        **chat_template_kwargs,
     )
     assert isinstance(input_ids_result, torch.Tensor)
     input_ids = input_ids_result
@@ -1373,6 +1381,33 @@ def sft_tir_tokenize_and_truncate_v1(
     row[LABELS_KEY] = labels.flatten()
     row[ATTENTION_MASK_KEY] = attention_mask.flatten()
     return row
+
+
+def normalize_tir_tool_schema(value: Any, field_name: str = TOOL_SCHEMA_COLUMN_KEY) -> list[dict[str, Any]]:
+    tools = normalize_optional_tool_schema(value, field_name)
+    if tools is None:
+        raise ValueError(f"{field_name} must be a non-empty tool schema list or JSON string.")
+    return tools
+
+
+normalize_tir_tool_call = normalize_qwen_tool_call
+normalize_tir_messages = normalize_qwen_messages
+
+
+def sft_tir_tokenize_and_truncate_v1(
+    row: dict[str, Any],
+    tokenizer: PreTrainedTokenizer,
+    max_seq_length: int,
+    sft_messages_key: str = DEFAULT_SFT_MESSAGES_KEY,
+    tool_schema_key: str = TOOL_SCHEMA_COLUMN_KEY,
+):
+    return sft_qwen_messages_tokenize_and_truncate_v1(
+        row=row,
+        tokenizer=tokenizer,
+        max_seq_length=max_seq_length,
+        sft_messages_key=sft_messages_key,
+        tool_schema_key=tool_schema_key,
+    )
 
 
 def last_turn_tulu_tokenize_and_truncate_v1(row: dict[str, Any], tokenizer: PreTrainedTokenizer, max_seq_length: int):
@@ -1712,6 +1747,7 @@ TRANSFORM_FNS = {
     "sft_tokenize_mask_out_prompt_v1": (sft_tokenize_mask_out_prompt_v1, "map"),
     "sft_filter_v1": (sft_filter_v1, "filter"),
     "sft_tulu_tokenize_and_truncate_v1": (sft_tulu_tokenize_and_truncate_v1, "map"),
+    "sft_qwen_messages_tokenize_and_truncate_v1": (sft_qwen_messages_tokenize_and_truncate_v1, "map"),
     "sft_tir_tokenize_and_truncate_v1": (sft_tir_tokenize_and_truncate_v1, "map"),
     "sft_tulu_filter_v1": (sft_tulu_filter_v1, "filter"),
     "preference_tokenize_v1": (preference_tokenize_v1, "map"),
