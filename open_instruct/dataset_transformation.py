@@ -2082,7 +2082,7 @@ def get_dataset_v1(dc: DatasetConfig, tc: TokenizerConfig):
                 remove_columns=[col for col in dataset.column_names if col not in target_columns],
                 num_proc=selected_num_proc,
                 new_fingerprint=new_fingerprint,
-                desc=f"{fn_name} for {dc.dataset_name}",
+                desc=f"{fn_name}",
             )
         elif fn_type == "batched_map":
             selected_num_proc = get_num_proc(len(dataset), num_proc, APPLY_CHAT_TEMPLATE_EXAMPLE_PER_SECOND_PER_CPU)
