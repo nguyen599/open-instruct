@@ -30,6 +30,10 @@ _BOUNDARIES_DTYPE = np.int64
 TOKEN_IDS_NPY_GLOB = "token_ids_part_*.npy"
 LABELS_MASK_NPY_GLOB = "labels_mask_part_*.npy"
 TOKEN_IDS_METADATA_GLOB = "token_ids_part_*.csv.gz"
+POLARS_SUPPORTED_TOKENIZE_FNS = {
+    "sft_qwen_messages_tokenize_and_truncate_v1",
+    "sft_qwen_messages_tokenize_and_truncate_batched_v1",
+}
 
 
 def _select_token_dtype(vocab_size: int):
@@ -134,8 +138,8 @@ def _recover_partial_state(
     return num_samples, current_position
 
 
-def _aggregate_stats(
-    train_dataset,
+def _aggregate_stats_from_sources(
+    sources: list[str],
     boundaries_path: pathlib.Path,
     labels_path: pathlib.Path,
     tokens_path: pathlib.Path,
@@ -172,7 +176,6 @@ def _aggregate_stats(
     num_samples_skipped = int((trainable_counts == 0).sum())
     total_trainable_tokens = int(trainable_counts.sum())
 
-    sources = train_dataset[dataset_transformation.DATASET_ORIGIN_KEY]
     if len(sources) != num_samples:
         raise ValueError(
             f"Dataset source column length {len(sources)} does not match number of processed "
@@ -205,6 +208,378 @@ def _aggregate_stats(
     }
 
 
+def _aggregate_stats(
+    train_dataset,
+    boundaries_path: pathlib.Path,
+    labels_path: pathlib.Path,
+    tokens_path: pathlib.Path,
+    num_samples: int,
+    total_tokens: int,
+    token_dtype,
+) -> dict[str, Any]:
+    return _aggregate_stats_from_sources(
+        sources=train_dataset[dataset_transformation.DATASET_ORIGIN_KEY],
+        boundaries_path=boundaries_path,
+        labels_path=labels_path,
+        tokens_path=tokens_path,
+        num_samples=num_samples,
+        total_tokens=total_tokens,
+        token_dtype=token_dtype,
+    )
+
+
+def _parse_mixer_amount(raw_value: str) -> int | float:
+    return float(raw_value) if "." in raw_value else int(raw_value)
+
+
+def _selected_indices(original_size: int, frac_or_num_samples: int | float, seed: int) -> list[int]:
+    if original_size == 0:
+        return []
+    if isinstance(frac_or_num_samples, int) and frac_or_num_samples > original_size:
+        target_size = frac_or_num_samples
+    elif isinstance(frac_or_num_samples, float):
+        target_size = int(frac_or_num_samples * original_size)
+    else:
+        target_size = int(frac_or_num_samples)
+
+    full_repeats = target_size // original_size
+    extra_samples = target_size % original_size
+    indices: list[int] = []
+    for _ in range(full_repeats):
+        indices.extend(range(original_size))
+    if extra_samples > 0:
+        rng = np.random.RandomState(seed)
+        indices.extend(rng.choice(original_size, size=extra_samples, replace=False).tolist())
+    return indices
+
+
+def _polars_backend_supported(
+    dataset_mixer_list: list[str],
+    dataset_mixer_list_splits: list[str],
+    dataset_transform_fn: list[str],
+    dataset_backend: str,
+) -> tuple[bool, str]:
+    if dataset_backend == "hf":
+        return False, "dataset_backend=hf"
+    if len(dataset_mixer_list) % 2 != 0:
+        return False, "dataset_mixer_list must contain alternating dataset and amount entries"
+    if len(dataset_mixer_list_splits) not in {1, len(dataset_mixer_list) // 2}:
+        return False, "dataset_mixer_list_splits length is incompatible with dataset_mixer_list"
+    splits = (
+        [dataset_mixer_list_splits[0]] * (len(dataset_mixer_list) // 2)
+        if len(dataset_mixer_list_splits) == 1
+        else dataset_mixer_list_splits
+    )
+    for dataset_name, split in zip(dataset_mixer_list[0::2], splits):
+        if split != "train":
+            return False, "polars backend supports only train split for local files"
+        if not os.path.exists(dataset_name) or not dataset_name.endswith(".parquet"):
+            return False, "polars backend supports only local parquet mixer entries"
+    if len(dataset_transform_fn) != 2:
+        return False, "polars backend supports only Qwen tokenize + sft_tulu_filter_v1 transforms"
+    if dataset_transform_fn[0] not in POLARS_SUPPORTED_TOKENIZE_FNS or dataset_transform_fn[1] != "sft_tulu_filter_v1":
+        return False, "polars backend supports only Qwen tokenize + sft_tulu_filter_v1 transforms"
+    return True, "supported local parquet Qwen SFT conversion"
+
+
+def _normalize_polars_value(value: Any, field_name: str) -> Any:
+    if isinstance(value, str) and field_name == dataset_transformation.DEFAULT_SFT_MESSAGES_KEY:
+        return dataset_transformation.parse_json_column_value(value, field_name)
+    return value
+
+
+def _load_polars_rows(
+    dataset_mixer_list: list[str],
+    dataset_mixer_list_splits: list[str],
+    seed: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    try:
+        import polars as pl
+    except ImportError as exc:
+        raise RuntimeError("dataset_backend=polars requires polars to be installed.") from exc
+
+    rows: list[dict[str, Any]] = []
+    dataset_statistics = []
+    dataset_order = []
+    columns = [dataset_transformation.DEFAULT_SFT_MESSAGES_KEY]
+    for dataset_name, amount in zip(dataset_mixer_list[0::2], dataset_mixer_list[1::2]):
+        logger.info("Loading local parquet with polars: %s", dataset_name)
+        schema = pl.read_parquet_schema(dataset_name)
+        if dataset_transformation.DEFAULT_SFT_MESSAGES_KEY not in schema:
+            raise ValueError(f"{dataset_name} must contain a '{dataset_transformation.DEFAULT_SFT_MESSAGES_KEY}' column.")
+        read_columns = list(columns)
+        if dataset_transformation.TOOL_SCHEMA_COLUMN_KEY in schema:
+            read_columns.append(dataset_transformation.TOOL_SCHEMA_COLUMN_KEY)
+        df = pl.read_parquet(dataset_name, columns=read_columns)
+        original_size = df.height
+        frac_or_num_samples = _parse_mixer_amount(amount)
+        indices = _selected_indices(original_size, frac_or_num_samples, seed)
+        data = df.to_dict(as_series=False)
+        selected_count = len(indices)
+        dataset_order.append(dataset_name)
+        dataset_statistics.append(
+            {
+                "dataset_name": dataset_name,
+                "dataset_split": "train",
+                "initial_instances": selected_count,
+                "final_instances": selected_count,
+                "instances_filtered": 0,
+                "frac_or_num_samples": frac_or_num_samples,
+                "original_dataset_size": original_size,
+                "is_upsampled": selected_count > original_size,
+                "upsampling_factor": selected_count / original_size if original_size > 0 else 1.0,
+            }
+        )
+        logger.info("Dataset %s: %d -> %d samples (factor: %s)", dataset_name, original_size, selected_count, amount)
+        for idx in indices:
+            row = {
+                dataset_transformation.DATASET_ORIGIN_KEY: dataset_name,
+                dataset_transformation.DEFAULT_SFT_MESSAGES_KEY: _normalize_polars_value(
+                    data[dataset_transformation.DEFAULT_SFT_MESSAGES_KEY][idx],
+                    dataset_transformation.DEFAULT_SFT_MESSAGES_KEY,
+                ),
+            }
+            if dataset_transformation.TOOL_SCHEMA_COLUMN_KEY in data:
+                row[dataset_transformation.TOOL_SCHEMA_COLUMN_KEY] = data[dataset_transformation.TOOL_SCHEMA_COLUMN_KEY][idx]
+            rows.append(row)
+    return rows, {"per_dataset_stats": dataset_statistics, "dataset_order": dataset_order}
+
+
+def _convert_local_parquet_to_numpy_sft_polars(
+    output_dir: pathlib.Path,
+    dataset_mixer_list: list[str],
+    dataset_mixer_list_splits: list[str],
+    tc: dataset_transformation.TokenizerConfig,
+    dataset_transform_fn: list[str],
+    transform_fn_args: list[dict[str, Any]],
+    max_seq_length: int | None,
+    shuffle_seed: int,
+    resume: bool,
+    visualize: bool,
+    num_examples: int,
+    batch_size: int,
+    dataset_backend: str,
+) -> bool:
+    supported, reason = _polars_backend_supported(
+        dataset_mixer_list=dataset_mixer_list,
+        dataset_mixer_list_splits=dataset_mixer_list_splits,
+        dataset_transform_fn=dataset_transform_fn,
+        dataset_backend=dataset_backend,
+    )
+    if not supported:
+        if dataset_backend == "polars":
+            raise ValueError(f"Cannot use dataset_backend=polars: {reason}")
+        logger.info("Polars dataset backend skipped: %s", reason)
+        return False
+
+    try:
+        rows, dataset_statistics = _load_polars_rows(dataset_mixer_list, dataset_mixer_list_splits, shuffle_seed)
+    except RuntimeError as exc:
+        if dataset_backend == "polars":
+            raise
+        logger.info("Polars dataset backend skipped: %s", exc)
+        return False
+    if not rows:
+        raise ValueError("No rows loaded from local parquet dataset.")
+    rng = np.random.default_rng(shuffle_seed)
+    permutation = rng.permutation(len(rows)).tolist()
+    rows = [rows[idx] for idx in permutation]
+    if num_examples > 0:
+        logger.info("Selecting %d examples for debugging", num_examples)
+        rows = rows[:num_examples]
+
+    if visualize:
+        logger.info("Visualizing first example with polars backend...")
+        preview = dataset_transformation.sft_qwen_messages_tokenize_and_truncate_v1(
+            row=dict(rows[0]),
+            tokenizer=tc.tokenizer,
+            max_seq_length=max_seq_length,
+        )
+        dataset_transformation.visualize_token(preview[dataset_transformation.INPUT_IDS_KEY], tc.tokenizer)
+        logger.info("Labels: %s", preview[dataset_transformation.LABELS_KEY])
+        logger.info("Attention mask: %s", preview[dataset_transformation.ATTENTION_MASK_KEY])
+
+    vocab_size = tc.tokenizer.vocab_size
+    token_dtype = _select_token_dtype(vocab_size)
+    token_item_size = np.dtype(token_dtype).itemsize
+    logger.info("Using polars dataset backend for local parquet conversion.")
+    logger.info("Using dtype '%s' for token_ids based on vocab size %d", np.dtype(token_dtype).name, vocab_size)
+
+    tokens_path = output_dir / "_tokens.partial.bin"
+    labels_path = output_dir / "_labels.partial.bin"
+    boundaries_path = output_dir / "_boundaries.partial.bin"
+
+    if resume:
+        start_idx, current_position = _recover_partial_state(tokens_path, labels_path, boundaries_path, token_item_size)
+        if start_idx > 0:
+            logger.info("=== RESUMING from partial files: %d samples / %d tokens ===", start_idx, current_position)
+        else:
+            logger.info("No recoverable partial files found, starting from beginning...")
+    else:
+        for path in (tokens_path, labels_path, boundaries_path):
+            path.unlink(missing_ok=True)
+        start_idx = 0
+        current_position = 0
+
+    total_raw_rows = len(rows)
+    valid_sources: list[str] = []
+    valid_sample_idx = -1
+    progress = tqdm(
+        desc="Polars tokenizing/writing",
+        file=sys.stdout,
+        bar_format="{l_bar}{bar}{r_bar}\n",
+        mininterval=10.0,
+        total=total_raw_rows,
+    )
+    collect_start = time.perf_counter()
+    utils.maybe_update_beaker_description(current_step=0, total_steps=total_raw_rows, start_time=collect_start)
+    last_description_update = collect_start
+
+    max_length = max_seq_length
+    for args in transform_fn_args:
+        if args.get("max_seq_length") is not None:
+            max_length = args["max_seq_length"]
+            break
+
+    with (
+        tokens_path.open("ab") as tokens_fh,
+        labels_path.open("ab") as labels_fh,
+        boundaries_path.open("ab") as boundaries_fh,
+    ):
+        for start in range(0, total_raw_rows, batch_size):
+            raw_batch = rows[start : start + batch_size]
+            tokenized = dataset_transformation.sft_qwen_messages_tokenize_and_truncate_batched_v1(
+                batch={
+                    dataset_transformation.DEFAULT_SFT_MESSAGES_KEY: [
+                        row[dataset_transformation.DEFAULT_SFT_MESSAGES_KEY] for row in raw_batch
+                    ],
+                    dataset_transformation.TOOL_SCHEMA_COLUMN_KEY: [
+                        row.get(dataset_transformation.TOOL_SCHEMA_COLUMN_KEY) for row in raw_batch
+                    ],
+                },
+                tokenizer=tc.tokenizer,
+                max_seq_length=max_length,
+            )
+            for row, sample_tokens, sample_labels, sample_attention in zip(
+                raw_batch,
+                tokenized[dataset_transformation.INPUT_IDS_KEY],
+                tokenized[dataset_transformation.LABELS_KEY],
+                tokenized[dataset_transformation.ATTENTION_MASK_KEY],
+            ):
+                labels_arr = np.asarray(sample_labels)
+                labels_mask = (labels_arr != dataset_transformation.MASKED_TOKEN_VALUE).astype(np.uint8)
+                if int(labels_mask.sum()) == 0:
+                    continue
+
+                valid_sample_idx += 1
+                source = row[dataset_transformation.DATASET_ORIGIN_KEY]
+                valid_sources.append(source)
+                if valid_sample_idx < start_idx:
+                    continue
+
+                sample_length = len(sample_tokens)
+                tokens_arr = np.asarray(sample_tokens, dtype=token_dtype)
+                attention_arr = np.asarray(sample_attention)
+                assert (attention_arr == 1).all(), (
+                    f"Expected all attention mask values to be 1, but found: {attention_arr}"
+                )
+                tokens_arr.tofile(tokens_fh)
+                labels_mask.tofile(labels_fh)
+                np.array([current_position, current_position + sample_length], dtype=_BOUNDARIES_DTYPE).tofile(
+                    boundaries_fh
+                )
+                current_position += sample_length
+
+            progress.update(len(raw_batch))
+            _flush_partial_files(tokens_fh, labels_fh, boundaries_fh)
+            now = time.perf_counter()
+            if now - last_description_update >= 30.0:
+                utils.maybe_update_beaker_description(
+                    current_step=min(start + len(raw_batch), total_raw_rows),
+                    total_steps=total_raw_rows,
+                    start_time=collect_start,
+                )
+                last_description_update = now
+
+    progress.close()
+    utils.maybe_update_beaker_description(current_step=total_raw_rows, total_steps=total_raw_rows, start_time=collect_start)
+    collect_elapsed = time.perf_counter() - collect_start
+    logger.info(
+        "Polars tokenize/write loop: %d raw rows, %d kept samples in %.2fs (%.1f raw rows/s)",
+        total_raw_rows,
+        len(valid_sources),
+        collect_elapsed,
+        total_raw_rows / collect_elapsed if collect_elapsed > 0 else 0.0,
+    )
+
+    total_samples = len(valid_sources)
+    total_tokens = current_position
+    logger.info("Aggregating per-dataset statistics from disk...")
+    stats_start = time.perf_counter()
+    stats = _aggregate_stats_from_sources(
+        sources=valid_sources,
+        boundaries_path=boundaries_path,
+        labels_path=labels_path,
+        tokens_path=tokens_path,
+        num_samples=total_samples,
+        total_tokens=total_tokens,
+        token_dtype=token_dtype,
+    )
+    logger.info("Stats aggregation: %.2fs", time.perf_counter() - stats_start)
+    for stat in dataset_statistics["per_dataset_stats"]:
+        dataset_name = stat["dataset_name"]
+        stat["final_instances"] = stats["per_dataset_counts"].get(dataset_name, 0)
+        stat["instances_filtered"] = stat["initial_instances"] - stat["final_instances"]
+
+    logger.info("Total sequences: %d", total_samples)
+    logger.info("Total tokens: %d", total_tokens)
+    logger.info("Maximum token ID: %d", stats["max_token_id"])
+    logger.info("Labels mask sum (trainable tokens): %d", stats["total_trainable_tokens"])
+    logger.info("Number of samples that should be skipped: %d", stats["num_samples_skipped"])
+
+    logger.info("Writing converted data to %s", output_dir)
+    token_ids_base = output_dir / "token_ids"
+    token_chunk_boundaries = _write_memmap_chunked_from_file(token_ids_base, tokens_path, total_tokens, token_dtype)
+
+    document_boundaries = (
+        np.memmap(boundaries_path, mode="r", dtype=_BOUNDARIES_DTYPE, shape=(total_samples, 2))
+        if total_samples > 0
+        else np.zeros((0, 2), dtype=_BOUNDARIES_DTYPE)
+    )
+    _write_metadata_for_chunks(token_ids_base, document_boundaries, token_chunk_boundaries)
+    del document_boundaries
+
+    labels_src = np.memmap(labels_path, mode="r", dtype=np.uint8, shape=(total_tokens,)) if total_tokens else None
+    for i, (chunk_start, chunk_end) in enumerate(token_chunk_boundaries):
+        filename = output_dir / f"labels_mask_part_{i:04d}.npy"
+        mmap = np.memmap(filename, mode="w+", dtype=np.bool_, shape=(chunk_end - chunk_start,))
+        mmap[:] = labels_src[chunk_start:chunk_end].astype(np.bool_)
+        mmap.flush()
+        logger.info("Written %s (%.2f GB)", filename, (chunk_end - chunk_start) * np.dtype(np.bool_).itemsize / 1024**3)
+    del labels_src
+
+    for path in (tokens_path, labels_path, boundaries_path):
+        path.unlink(missing_ok=True)
+
+    write_dataset_statistics(
+        output_dir=output_dir,
+        dataset_statistics=dataset_statistics,
+        total_instances=total_samples,
+        total_tokens=total_tokens,
+        total_trainable_tokens=stats["total_trainable_tokens"],
+        num_samples_skipped=stats["num_samples_skipped"],
+        tokenizer_name=tc.tokenizer_name_or_path,
+        max_seq_length=max_seq_length,
+        chat_template_name=tc.chat_template_name,
+        per_dataset_counts=stats["per_dataset_counts"],
+        per_dataset_tokens=stats["per_dataset_tokens"],
+        per_dataset_trainable_tokens=stats["per_dataset_trainable_tokens"],
+        per_dataset_filtered=stats["per_dataset_filtered"],
+    )
+    logger.info("Data conversion completed successfully with polars backend!")
+    return True
+
+
 def convert_hf_to_numpy_sft(
     output_dir: pathlib.Path,
     dataset_mixer_list: list[str],
@@ -224,6 +599,7 @@ def convert_hf_to_numpy_sft(
     tokenizer_config_only: bool = False,
     num_examples: int = 0,
     batch_size: int = 1000,
+    dataset_backend: Literal["auto", "hf", "polars"] = "auto",
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -237,6 +613,23 @@ def convert_hf_to_numpy_sft(
     logger.info("Tokenizer saved successfully!")
 
     if tokenizer_config_only:
+        return
+
+    if _convert_local_parquet_to_numpy_sft_polars(
+        output_dir=output_dir,
+        dataset_mixer_list=dataset_mixer_list,
+        dataset_mixer_list_splits=dataset_mixer_list_splits,
+        tc=tc,
+        dataset_transform_fn=dataset_transform_fn,
+        transform_fn_args=transform_fn_args,
+        max_seq_length=max_seq_length,
+        shuffle_seed=shuffle_seed,
+        resume=resume,
+        visualize=visualize,
+        num_examples=num_examples,
+        batch_size=batch_size,
+        dataset_backend=dataset_backend,
+    ):
         return
 
     train_dataset, dataset_statistics = dataset_transformation.get_cached_dataset_tulu_with_statistics(

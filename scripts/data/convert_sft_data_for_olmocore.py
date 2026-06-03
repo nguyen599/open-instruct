@@ -102,6 +102,9 @@ class ConvertSFTDataArguments:
     """The mode to use for caching the dataset."""
     dataset_cache_mode: Literal["hf", "local"] = "local"
 
+    """Dataset transformation backend. auto uses polars for supported local parquet SFT data, otherwise HF datasets."""
+    dataset_backend: Literal["auto", "hf", "polars"] = "auto"
+
     """The directory to save the local dataset cache to."""
     dataset_local_cache_dir: str = "local_dataset_cache"
 
@@ -168,6 +171,7 @@ def main(args: ConvertSFTDataArguments, tc: dataset_transformation.TokenizerConf
         visualize=args.visualize,
         tokenizer_config_only=args.tokenizer_config_only,
         num_examples=args.num_examples,
+        dataset_backend=args.dataset_backend,
     )
 
 
