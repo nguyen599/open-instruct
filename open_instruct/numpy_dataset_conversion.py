@@ -435,6 +435,8 @@ def _convert_local_parquet_to_numpy_sft_polars(
     collect_start = time.perf_counter()
     utils.maybe_update_beaker_description(current_step=0, total_steps=total_raw_rows, start_time=collect_start)
     last_description_update = collect_start
+    skipped_tokenization_errors = 0
+    skipped_no_labels = 0
 
     max_length = max_seq_length
     for args in transform_fn_args:
@@ -488,7 +490,10 @@ def _convert_local_parquet_to_numpy_sft_polars(
                     None
                 ] * len(raw_batch)
                 for future in as_completed(futures):
-                    tokenized_batch[futures[future]] = future.result()
+                    try:
+                        tokenized_batch[futures[future]] = future.result()
+                    except Exception:
+                        skipped_tokenization_errors += 1
                     progress.update(1)
                     now = time.perf_counter()
                     if now - last_description_update >= 30.0:
@@ -504,6 +509,7 @@ def _convert_local_parquet_to_numpy_sft_polars(
                         continue
                     row, sample_tokens, labels_mask, sample_attention = item
                     if int(labels_mask.sum()) == 0:
+                        skipped_no_labels += 1
                         continue
 
                     valid_sample_idx += 1
@@ -537,6 +543,13 @@ def _convert_local_parquet_to_numpy_sft_polars(
         collect_elapsed,
         total_raw_rows / collect_elapsed if collect_elapsed > 0 else 0.0,
     )
+    if skipped_tokenization_errors or skipped_no_labels:
+        logger.info(
+            "Skipped %d rows during polars conversion (%d row errors, %d rows with no trainable labels).",
+            skipped_tokenization_errors + skipped_no_labels,
+            skipped_tokenization_errors,
+            skipped_no_labels,
+        )
 
     total_samples = len(valid_sources)
     total_tokens = current_position
