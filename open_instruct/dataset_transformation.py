@@ -1349,7 +1349,7 @@ def parse_qwen_tool_arguments(value: Any, field_name: str) -> dict[str, Any]:
         return parsed
     if isinstance(parsed, str):
         return {"code": parsed}
-    raise ValueError(f"{field_name} must parse to an object or raw code string, got {type(parsed).__name__}, {parsed}.")
+    raise ValueError(f"{field_name} must parse to an object or raw code string, got {type(parsed).__name__}, {parsed}, RAW: {stripped}.")
 
 
 def normalize_optional_tool_schema(value: Any, field_name: str = TOOL_SCHEMA_COLUMN_KEY) -> list[dict[str, Any]] | None:
