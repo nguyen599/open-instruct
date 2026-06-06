@@ -120,6 +120,9 @@ class ConvertSFTDataArguments:
     """Number of examples to process for debugging. 0 means process all examples."""
     num_examples: int = field(default=0)
 
+    """Rows to tokenize/write per conversion batch."""
+    batch_size: int = field(default=1000)
+
     """Visualize first token sequence"""
     visualize: bool = field(default=False)
 
@@ -171,6 +174,7 @@ def main(args: ConvertSFTDataArguments, tc: dataset_transformation.TokenizerConf
         visualize=args.visualize,
         tokenizer_config_only=args.tokenizer_config_only,
         num_examples=args.num_examples,
+        batch_size=args.batch_size,
         dataset_backend=args.dataset_backend,
     )
 
