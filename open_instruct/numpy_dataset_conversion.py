@@ -444,7 +444,10 @@ def _convert_local_parquet_to_numpy_sft_polars(
             max_length = args["max_seq_length"]
             break
     tokenize_workers = dataset_transformation.get_qwen_batch_tokenize_threads(total_raw_rows)
-    tokenize_window_size = max(1, min(batch_size, tokenize_workers * 4))
+    tokenize_window_size = dataset_transformation.get_qwen_batch_tokenize_window_size(
+        batch_size=batch_size,
+        num_threads=tokenize_workers,
+    )
     logger.info(
         "Polars tokenization parallelism: workers=%d window_size=%d requested_batch_size=%d",
         tokenize_workers,

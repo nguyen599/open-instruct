@@ -133,6 +133,7 @@ DEFAULT_DATASET_MAP_BATCH_SIZE = 4
 DATASET_MAP_BATCH_SIZE_ENV = "OPEN_INSTRUCT_DATASET_MAP_BATCH_SIZE"
 DEFAULT_QWEN_BATCH_TOKENIZE_THREADS = 8
 QWEN_BATCH_TOKENIZE_THREADS_ENV = "OPEN_INSTRUCT_QWEN_BATCH_TOKENIZE_THREADS"
+QWEN_BATCH_TOKENIZE_WINDOW_SIZE_ENV = "OPEN_INSTRUCT_QWEN_BATCH_TOKENIZE_WINDOW_SIZE"
 
 
 def get_num_proc(dataset_len: int, num_available_cpus: int, example_per_second_per_cpu) -> int:
@@ -167,6 +168,24 @@ def get_qwen_batch_tokenize_threads(batch_size: int) -> int:
         )
         threads = DEFAULT_QWEN_BATCH_TOKENIZE_THREADS
     return min(threads, max(1, batch_size))
+
+
+def get_qwen_batch_tokenize_window_size(batch_size: int, num_threads: int) -> int:
+    default_window_size = max(1, batch_size)
+    raw_value = os.environ.get(QWEN_BATCH_TOKENIZE_WINDOW_SIZE_ENV)
+    if raw_value is None:
+        return default_window_size
+    try:
+        window_size = max(1, int(float(raw_value)))
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r; using requested batch size %d.",
+            QWEN_BATCH_TOKENIZE_WINDOW_SIZE_ENV,
+            raw_value,
+            default_window_size,
+        )
+        return default_window_size
+    return min(window_size, default_window_size)
 
 
 COLORS = ["on red", "on green", "on blue", "on yellow", "on magenta"]
