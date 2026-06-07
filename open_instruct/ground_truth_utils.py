@@ -21,6 +21,7 @@ from collections.abc import Callable
 from typing import Any, Literal
 
 import numpy as np
+from openai import AsyncOpenAI
 import requests
 
 from open_instruct import context_window_checker, logger_utils
@@ -36,16 +37,11 @@ from open_instruct.math_utils import (
     remove_boxed,
 )
 from open_instruct.rubrics.prompts import RUBRIC_SCORING_PROMPT
-from open_instruct.rubrics.run_utils import extract_json_from_response, run_litellm_async, run_litellm_async_raw
+from open_instruct.rubrics.run_utils import extract_json_from_response
 from open_instruct.utils import extract_final_answer
 
 logger = logger_utils.setup_logger(__name__)
 
-# remove excessive logging from liteLLM
-logging.getLogger("LiteLLM").setLevel(logging.WARNING)
-logging.getLogger("litellm").setLevel(logging.ERROR)
-logging.getLogger("litellm.cost_calculator").setLevel(logging.CRITICAL)
-logging.getLogger("litellm._client").setLevel(logging.CRITICAL)
 logging.getLogger("cost_calculator").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
@@ -83,6 +79,26 @@ class LMJudgeVerifierConfig(VerifierConfig):
     llm_judge_temperature: float
     llm_judge_timeout: int
     seed: int
+    llm_judge_base_url: str | None = None
+    llm_judge_api_key_env: str = "OPENAI_API_KEY"
+    llm_judge_api_key: str | None = None
+    llm_judge_prompt_template: str | None = None
+    llm_judge_prompt_template_file: str | None = None
+    llm_judge_use_full_response: bool = False
+
+    def resolved_base_url(self) -> str | None:
+        return self.llm_judge_base_url or os.environ.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_API_BASE")
+
+    def resolved_api_key(self) -> str:
+        if self.llm_judge_api_key:
+            return self.llm_judge_api_key
+        env_name = self.llm_judge_api_key_env or "OPENAI_API_KEY"
+        api_key = os.environ.get(env_name)
+        if not api_key:
+            raise ValueError(
+                f"Missing OpenAI-compatible judge API key. Set {env_name} or pass --llm_judge_api_key."
+            )
+        return api_key
 
 
 @dataclasses.dataclass
@@ -699,11 +715,66 @@ class LMJudgeVerifier(VerifierFunction):
     Verifier that uses a language model's judgement to score a response.
     """
 
-    def __init__(self, judge_type: str, verifier_config: LMJudgeVerifierConfig) -> None:
-        super().__init__(f"general-{judge_type}", verifier_config=verifier_config, weight=1.0)
-        self.prompt_template = JUDGE_PROMPT_MAP[judge_type]
-        self.extractor = EXTRACTOR_MAP[judge_type]
-        os.environ["AZURE_API_VERSION"] = "2024-12-01-preview"
+    _clients: dict[tuple[str | None, str], AsyncOpenAI] = {}
+
+    def __init__(
+        self,
+        judge_type: str,
+        verifier_config: LMJudgeVerifierConfig,
+        *,
+        name: str | None = None,
+        prompt_template: str | None = None,
+        extractor=None,
+    ) -> None:
+        super().__init__(name or f"general-{judge_type}", verifier_config=verifier_config, weight=1.0)
+        self.prompt_template = prompt_template or JUDGE_PROMPT_MAP[judge_type]
+        self.extractor = extractor or EXTRACTOR_MAP[judge_type]
+        self._custom_prompt = prompt_template is not None
+
+    @classmethod
+    def _client_for_values(cls, base_url: str | None, api_key: str, timeout: int) -> AsyncOpenAI:
+        key = (base_url, api_key)
+        client = cls._clients.get(key)
+        if client is None:
+            client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
+            cls._clients[key] = client
+        return client
+
+    @classmethod
+    def _client_for_config(cls, verifier_config: LMJudgeVerifierConfig) -> AsyncOpenAI:
+        return cls._client_for_values(
+            verifier_config.resolved_base_url(),
+            verifier_config.resolved_api_key(),
+            verifier_config.llm_judge_timeout,
+        )
+
+    @staticmethod
+    def _read_prompt_template(path: str) -> str:
+        with open(path, encoding="utf-8") as file_obj:
+            return file_obj.read()
+
+    @classmethod
+    def custom_prompt_template(cls, verifier_config: LMJudgeVerifierConfig) -> str | None:
+        if verifier_config.llm_judge_prompt_template_file:
+            return cls._read_prompt_template(verifier_config.llm_judge_prompt_template_file)
+        return verifier_config.llm_judge_prompt_template
+
+    def format_prompt(self, prediction: str, label: str, query: str | None) -> str:
+        final_answer = extract_final_answer(prediction)
+        judge_output = prediction if self.verifier_config.llm_judge_use_full_response else final_answer
+        values = {
+            "input": query or "",
+            "output": judge_output,
+            "prediction": prediction,
+            "final_answer": final_answer,
+            "label": label,
+        }
+        if self._custom_prompt:
+            rendered = self.prompt_template
+            for key, value in values.items():
+                rendered = rendered.replace("{" + key + "}", str(value))
+            return rendered
+        return self.prompt_template.format(**values)
 
     def parse_completion(self, completion):
         """
@@ -740,8 +811,10 @@ class LMJudgeVerifier(VerifierFunction):
         """
         Get the cost of the response.
         """
-        model_name = model.split("/")[-1]  # for litellm, discard the namespace
+        model_name = model.split("/")[-1]
         model_name = model_name.replace("-standard", "")  # azure OAI models have -standard in the name
+        if getattr(response, "usage", None) is None:
+            return 0.0
         return (
             PRICE_PER_MILLION_TOKENS.get(model_name, {}).get("input", 0) * response.usage.prompt_tokens
             + PRICE_PER_MILLION_TOKENS.get(model_name, {}).get("output", 0) * response.usage.completion_tokens
@@ -758,8 +831,7 @@ class LMJudgeVerifier(VerifierFunction):
         """
         Asynchronous version of __call__ that properly handles the async OpenAI client.
         """
-        final_answer = extract_final_answer(prediction)
-        prompt = self.prompt_template.format(input=query, output=final_answer, label=label)
+        prompt = self.format_prompt(prediction=prediction, label=label, query=query)
 
         max_retries = 3  # for rate limits
         retry_delay = 1.0
@@ -797,12 +869,12 @@ class LMJudgeVerifier(VerifierFunction):
                         logger.error("Cannot fit request within context window even after truncation.")
                         return VerificationResult(score=0.0, cost=0.0, reasoning="Error: Context window exceeded")
                 # end of Faeze's context window check
-                response = await run_litellm_async_raw(
-                    model_name=self.verifier_config.llm_judge_model,
+                client = self._client_for_config(self.verifier_config)
+                response = await client.chat.completions.create(
+                    model=self.verifier_config.llm_judge_model,
                     messages=messages,
                     temperature=self.verifier_config.llm_judge_temperature,
                     max_completion_tokens=self.verifier_config.llm_judge_max_tokens,
-                    seed=self.verifier_config.seed,
                     timeout=self.verifier_config.llm_judge_timeout,
                 )
                 reasoning, score = self.parse_completion(response)
@@ -851,8 +923,14 @@ class LMJudgeVerifier(VerifierFunction):
     @classmethod
     async def cleanup_all_clients(cls):
         """
-        Judge requests use the shared LiteLLM helper and do not own per-verifier clients.
+        Close OpenAI-compatible judge clients.
         """
+        for client in cls._clients.values():
+            try:
+                await client.close()
+            except Exception:
+                logger.exception("Failed to close OpenAI judge client")
+        cls._clients.clear()
         return None
 
     @classmethod
@@ -1060,10 +1138,27 @@ class RubricVerifierConfig(VerifierConfig):
     """Configuration for rubric verifier."""
 
     rubric_judge_model: str = "gpt-4.1"
+    rubric_judge_base_url: str | None = None
+    rubric_judge_api_key_env: str = "OPENAI_API_KEY"
+    rubric_judge_api_key: str | None = None
     rubric_judge_max_tokens: int = 2048
     rubric_judge_temperature: float = 0.0
     rubric_judge_timeout: int = 60
     seed: int = 42
+
+    def resolved_base_url(self) -> str | None:
+        return self.rubric_judge_base_url or os.environ.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_API_BASE")
+
+    def resolved_api_key(self) -> str:
+        if self.rubric_judge_api_key:
+            return self.rubric_judge_api_key
+        env_name = self.rubric_judge_api_key_env or "OPENAI_API_KEY"
+        api_key = os.environ.get(env_name)
+        if not api_key:
+            raise ValueError(
+                f"Missing OpenAI-compatible rubric judge API key. Set {env_name} or pass --rubric_judge_api_key."
+            )
+        return api_key
 
 
 class RubricVerifier(VerifierFunction):
@@ -1079,6 +1174,8 @@ class RubricVerifier(VerifierFunction):
     Environment Variables:
         RUBRIC_JUDGE_MODEL: Override the LLM model used for rubric scoring.
             Defaults to RubricVerifierConfig.rubric_judge_model ("gpt-4.1").
+        OPENAI_BASE_URL or OPENAI_API_BASE: OpenAI-compatible endpoint for rubric scoring.
+        OPENAI_API_KEY: API key for rubric scoring unless --rubric_judge_api_key_env/--rubric_judge_api_key is used.
     """
 
     def __init__(self, verifier_config: RubricVerifierConfig) -> None:
@@ -1132,14 +1229,22 @@ class RubricVerifier(VerifierFunction):
 
             try:
                 model_name = os.environ.get("RUBRIC_JUDGE_MODEL", self.config.rubric_judge_model)
-                resp = await run_litellm_async(
-                    model_name=model_name,
-                    system_prompt=RUBRIC_SCORING_PROMPT,
-                    user_prompt=user_prompt,
+                client = LMJudgeVerifier._client_for_values(
+                    self.config.resolved_base_url(),
+                    self.config.resolved_api_key(),
+                    self.config.rubric_judge_timeout,
+                )
+                response = await client.chat.completions.create(
+                    model=model_name,
+                    messages=[
+                        {"role": "system", "content": RUBRIC_SCORING_PROMPT},
+                        {"role": "user", "content": user_prompt},
+                    ],
                     temperature=self.config.rubric_judge_temperature,
-                    max_tokens=self.config.rubric_judge_max_tokens,
+                    max_completion_tokens=self.config.rubric_judge_max_tokens,
                     timeout=self.config.rubric_judge_timeout,
                 )
+                resp = response.choices[0].message.content or ""
 
                 obj = extract_json_from_response(resp)
                 if obj and isinstance(obj, dict) and "score" in obj:
@@ -1211,6 +1316,18 @@ def build_all_verifiers(args, streaming_config=None) -> dict[str, VerifierFuncti
 
     for judge_type in JUDGE_PROMPT_MAP:
         instance = LMJudgeVerifier(judge_type, LMJudgeVerifierConfig.from_args(args, streaming_config))
+        verifiers[instance.name.lower()] = instance
+
+    judge_config = LMJudgeVerifierConfig.from_args(args, streaming_config)
+    custom_prompt_template = LMJudgeVerifier.custom_prompt_template(judge_config)
+    if custom_prompt_template is not None:
+        instance = LMJudgeVerifier(
+            "quality_rubric",
+            judge_config,
+            name="llm_judge",
+            prompt_template=custom_prompt_template,
+            extractor=EXTRACTOR_MAP["quality_rubric"],
+        )
         verifiers[instance.name.lower()] = instance
 
     # if we have remap arg, remap!

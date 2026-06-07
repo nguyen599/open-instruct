@@ -17,6 +17,8 @@ from open_instruct.ground_truth_utils import (
     LMJudgeVerifier,
     LMJudgeVerifierConfig,
     PuzzleMatcherVerifier,
+    RubricVerifier,
+    RubricVerifierConfig,
     cleanup_all_llm_judge_clients,
 )
 
@@ -173,7 +175,7 @@ class TestGSM8KVerifier(unittest.TestCase):
         self.assertEqual(result.score, expected_score)
 
 
-def _make_litellm_response(content: str, prompt_tokens: int = 10, completion_tokens: int = 5):
+def _make_openai_response(content: str, prompt_tokens: int = 10, completion_tokens: int = 5):
     return SimpleNamespace(
         choices=[SimpleNamespace(message=SimpleNamespace(content=content))],
         usage=SimpleNamespace(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens),
@@ -182,10 +184,13 @@ def _make_litellm_response(content: str, prompt_tokens: int = 10, completion_tok
 
 class TestLMJudgeVerifier(unittest.TestCase):
     def setUp(self):
+        LMJudgeVerifier._clients.clear()
         self.verifier = LMJudgeVerifier(
             "quality",
             LMJudgeVerifierConfig(
                 llm_judge_model="azure/gpt-4o-mini-standard",
+                llm_judge_base_url="https://example.test/v1",
+                llm_judge_api_key="test-key",
                 llm_judge_max_tokens=256,
                 llm_judge_max_context_length=4096,
                 llm_judge_temperature=0.0,
@@ -194,13 +199,15 @@ class TestLMJudgeVerifier(unittest.TestCase):
             ),
         )
 
-    def test_async_call_uses_shared_helper_and_preserves_retry_and_cost(self):
-        response = _make_litellm_response('{"REASONING":"clear","SCORE":7}', prompt_tokens=10, completion_tokens=5)
-        raw_helper = AsyncMock(side_effect=[RuntimeError("temporary"), response])
+    def test_async_call_uses_openai_client_and_preserves_retry_and_cost(self):
+        response = _make_openai_response('{"REASONING":"clear","SCORE":7}', prompt_tokens=10, completion_tokens=5)
+        create_mock = AsyncMock(side_effect=[RuntimeError("temporary"), response])
+        close_mock = AsyncMock()
+        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create_mock)), close=close_mock)
         sleep_mock = AsyncMock()
 
         with (
-            patch("open_instruct.ground_truth_utils.run_litellm_async_raw", raw_helper),
+            patch("open_instruct.ground_truth_utils.AsyncOpenAI", return_value=client) as client_cls,
             patch(
                 "open_instruct.ground_truth_utils.context_window_checker.check_context_window_limit", return_value=True
             ),
@@ -218,16 +225,94 @@ class TestLMJudgeVerifier(unittest.TestCase):
         self.assertAlmostEqual(result.score, 0.7)
         self.assertEqual(result.reasoning, "clear")
         self.assertAlmostEqual(result.cost, 0.0000045)
-        self.assertEqual(raw_helper.await_count, 2)
+        self.assertEqual(create_mock.await_count, 2)
         self.assertEqual(sleep_mock.await_count, 1)
-        self.assertEqual(raw_helper.await_args_list[-1].kwargs["model_name"], "azure/gpt-4o-mini-standard")
-        self.assertEqual(raw_helper.await_args_list[-1].kwargs["max_completion_tokens"], 256)
-        self.assertNotIn("num_retries", raw_helper.await_args_list[-1].kwargs)
-        self.assertNotIn("fallbacks", raw_helper.await_args_list[-1].kwargs)
+        client_cls.assert_called_once_with(
+            api_key="test-key",
+            base_url="https://example.test/v1",
+            timeout=30,
+        )
+        self.assertEqual(create_mock.await_args_list[-1].kwargs["model"], "azure/gpt-4o-mini-standard")
+        self.assertEqual(create_mock.await_args_list[-1].kwargs["max_completion_tokens"], 256)
+        self.assertNotIn("num_retries", create_mock.await_args_list[-1].kwargs)
+        self.assertNotIn("fallbacks", create_mock.await_args_list[-1].kwargs)
+
+    def test_custom_prompt_template_uses_full_response_placeholders(self):
+        config = LMJudgeVerifierConfig(
+            llm_judge_model="judge-model",
+            llm_judge_base_url="https://example.test/v1",
+            llm_judge_api_key="test-key",
+            llm_judge_prompt_template="Question: {input}\nOutput: {output}\nRef: {label}",
+            llm_judge_use_full_response=True,
+            llm_judge_max_tokens=256,
+            llm_judge_max_context_length=4096,
+            llm_judge_temperature=0.0,
+            llm_judge_timeout=30,
+            seed=17,
+        )
+        verifier = LMJudgeVerifier(
+            "quality_rubric",
+            config,
+            name="llm_judge",
+            prompt_template=config.llm_judge_prompt_template,
+        )
+
+        prompt = verifier.format_prompt(
+            prediction="<think>proof idea</think>\n<answer>final</answer>",
+            label="reference proof",
+            query="prove this",
+        )
+
+        self.assertIn("Question: prove this", prompt)
+        self.assertIn("<think>proof idea</think>", prompt)
+        self.assertIn("Ref: reference proof", prompt)
 
     def test_cleanup_helpers_are_safe_noops(self):
         self.assertIsNone(asyncio.run(LMJudgeVerifier.cleanup_all_clients()))
         self.assertIsNone(asyncio.run(cleanup_all_llm_judge_clients()))
+
+
+class TestRubricVerifier(unittest.TestCase):
+    def setUp(self):
+        LMJudgeVerifier._clients.clear()
+        self.verifier = RubricVerifier(
+            RubricVerifierConfig(
+                rubric_judge_model="rubric-model",
+                rubric_judge_base_url="https://example.test/v1",
+                rubric_judge_api_key="test-key",
+                rubric_judge_max_tokens=128,
+                rubric_judge_temperature=0.0,
+                rubric_judge_timeout=30,
+            )
+        )
+
+    def test_async_call_uses_openai_client(self):
+        response = _make_openai_response('{"score": 2}')
+        create_mock = AsyncMock(return_value=response)
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create_mock)),
+            close=AsyncMock(),
+        )
+        label = {"query": "prove this", "rubrics": [{"description": "correct proof", "weight": 1.0}]}
+
+        with patch("open_instruct.ground_truth_utils.AsyncOpenAI", return_value=client) as client_cls:
+            result = asyncio.run(
+                self.verifier.async_call(
+                    tokenized_prediction=[],
+                    prediction="Here is the proof.",
+                    label=label,
+                    query="prove this",
+                )
+            )
+
+        self.assertEqual(result.score, 1.0)
+        client_cls.assert_called_once_with(
+            api_key="test-key",
+            base_url="https://example.test/v1",
+            timeout=30,
+        )
+        self.assertEqual(create_mock.await_args.kwargs["model"], "rubric-model")
+        self.assertEqual(create_mock.await_args.kwargs["max_completion_tokens"], 128)
 
 
 class TestIFEvalVerifierEmptyInstructions(unittest.TestCase):

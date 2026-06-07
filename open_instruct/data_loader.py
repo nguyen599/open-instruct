@@ -458,10 +458,23 @@ class StreamingDataLoaderConfig:
 
     # LLM judge verifier
     llm_judge_model: str = "azure/gpt-4o-mini-standard"
+    llm_judge_base_url: str | None = None
+    llm_judge_api_key_env: str = "OPENAI_API_KEY"
+    llm_judge_api_key: str | None = None
+    llm_judge_prompt_template: str | None = None
+    llm_judge_prompt_template_file: str | None = None
+    llm_judge_use_full_response: bool = False
     llm_judge_max_tokens: int = 2048
     llm_judge_max_context_length: int = 8192
     llm_judge_temperature: float = 1.0
     llm_judge_timeout: int = 60
+    rubric_judge_model: str = "gpt-5.5"
+    rubric_judge_base_url: str | None = None
+    rubric_judge_api_key_env: str = "OPENAI_API_KEY"
+    rubric_judge_api_key: str | None = None
+    rubric_judge_max_tokens: int = 2048
+    rubric_judge_temperature: float = 0.0
+    rubric_judge_timeout: int = 60
 
     # Code verifier
     code_api_url: str = field(
