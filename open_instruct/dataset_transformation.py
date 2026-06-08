@@ -93,6 +93,15 @@ def qwen_fast_char_mask_enabled() -> bool:
     return raw_value.strip().lower() not in FALSE_ENV_VALUES
 
 
+def tokenizer_cache_kwargs() -> dict[str, str]:
+    cache_dir = (
+        os.environ.get("HF_HUB_CACHE")
+        or os.environ.get("HUGGINGFACE_HUB_CACHE")
+        or os.environ.get("TRANSFORMERS_CACHE")
+    )
+    return {"cache_dir": cache_dir} if cache_dir else {}
+
+
 def get_commit_hash(
     model_name_or_path: str, revision: str, filename: str = "config.json", repo_type: str = "model"
 ) -> str | None:
@@ -721,6 +730,7 @@ def get_tokenizer_simple_v1(tc: "TokenizerConfig"):
         revision=tc.tokenizer_revision,
         trust_remote_code=tc.trust_remote_code,
         use_fast=tc.use_fast,
+        **tokenizer_cache_kwargs(),
     )
     return tokenizer
 
@@ -731,6 +741,7 @@ def get_tokenizer_tulu_v1(tc: "TokenizerConfig"):
         revision=tc.tokenizer_revision,
         trust_remote_code=tc.trust_remote_code,
         use_fast=tc.use_fast,
+        **tokenizer_cache_kwargs(),
     )
     # no default pad token for llama!
     # here we add all special tokens again, because the default ones are not in the special_tokens_map
@@ -768,7 +779,9 @@ def get_tokenizer_tulu_v1(tc: "TokenizerConfig"):
     else:
         try:
             tokenizer.chat_template = AutoTokenizer.from_pretrained(
-                tc.tokenizer_name_or_path, revision=tc.tokenizer_revision
+                tc.tokenizer_name_or_path,
+                revision=tc.tokenizer_revision,
+                **tokenizer_cache_kwargs(),
             ).chat_template
         except Exception:
             raise ValueError(f"Could not find chat template for {tc.tokenizer_name_or_path}.") from None
@@ -792,6 +805,7 @@ def get_tokenizer_tulu_v2_1(tc: "TokenizerConfig"):
         revision=tc.tokenizer_revision,
         trust_remote_code=tc.trust_remote_code,
         use_fast=tc.use_fast,
+        **tokenizer_cache_kwargs(),
     )
     # no default pad token for llama!
     # here we add all special tokens again, because the default ones are not in the special_tokens_map
@@ -832,7 +846,9 @@ def get_tokenizer_tulu_v2_1(tc: "TokenizerConfig"):
     if tc.chat_template_name is None:
         try:
             tokenizer.chat_template = AutoTokenizer.from_pretrained(
-                tc.tokenizer_name_or_path, revision=tc.tokenizer_revision
+                tc.tokenizer_name_or_path,
+                revision=tc.tokenizer_revision,
+                **tokenizer_cache_kwargs(),
             ).chat_template
         except Exception:
             raise ValueError(f"Could not find chat template for {tc.tokenizer_name_or_path}.") from None
@@ -861,6 +877,7 @@ def get_chat_template_from_model(tc: "TokenizerConfig") -> str:
         tc.chat_template_model,
         trust_remote_code=tc.trust_remote_code,
         use_fast=tc.use_fast,
+        **tokenizer_cache_kwargs(),
     )
     chat_template = getattr(template_tokenizer, "chat_template", None)
     if not chat_template:
@@ -886,6 +903,7 @@ def get_tokenizer_tulu_v2_2(tc: "TokenizerConfig"):
         revision=tc.tokenizer_revision,
         trust_remote_code=tc.trust_remote_code,
         use_fast=tc.use_fast,
+        **tokenizer_cache_kwargs(),
     )
     # no default pad token for llama!
     # here we add all special tokens again, because the default ones are not in the special_tokens_map
@@ -932,7 +950,9 @@ def get_tokenizer_tulu_v2_2(tc: "TokenizerConfig"):
     else:
         try:
             tokenizer.chat_template = AutoTokenizer.from_pretrained(
-                tc.tokenizer_name_or_path, revision=tc.tokenizer_revision
+                tc.tokenizer_name_or_path,
+                revision=tc.tokenizer_revision,
+                **tokenizer_cache_kwargs(),
             ).chat_template
         except Exception:
             raise ValueError(f"Could not find chat template for {tc.tokenizer_name_or_path}.") from None
