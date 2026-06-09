@@ -475,6 +475,23 @@ class StreamingDataLoaderConfig:
     rubric_judge_max_tokens: int = 2048
     rubric_judge_temperature: float = 0.0
     rubric_judge_timeout: int = 60
+    deepseekmath_v2_proof_judge_model: str | None = None
+    deepseekmath_v2_meta_judge_model: str | None = None
+    deepseekmath_v2_base_url: str | None = None
+    deepseekmath_v2_api_key_env: str = "OPENAI_API_KEY"
+    deepseekmath_v2_api_key: str | None = None
+    deepseekmath_v2_proof_prompt_template: str | None = None
+    deepseekmath_v2_proof_prompt_template_file: str | None = None
+    deepseekmath_v2_meta_prompt_template: str | None = None
+    deepseekmath_v2_meta_prompt_template_file: str | None = None
+    deepseekmath_v2_max_tokens: int = 92160
+    deepseekmath_v2_max_context_length: int = 102400
+    deepseekmath_v2_temperature: float = 0.0
+    deepseekmath_v2_timeout: int = 60
+    deepseekmath_v2_proof_weight: float = 0.76
+    deepseekmath_v2_self_eval_weight: float = 0.24
+    deepseekmath_v2_enable_meta_verification: bool = True
+    deepseekmath_v2_require_format: bool = True
 
     # Code verifier
     code_api_url: str = field(

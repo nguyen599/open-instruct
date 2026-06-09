@@ -944,6 +944,490 @@ class LMJudgeVerifier(VerifierFunction):
         return LMJudgeVerifierConfig
 
 
+DEEPSEEKMATH_V2_PROOF_JUDGE_PROMPT = r"""
+## Instruction
+
+Your task is to evaluate the quality of a solution to a problem. The problem may ask for a proof of statement, or ask for an answer. If finding an answer is required, the solution should present the answer, and it should also be a rigorous proof of that answer being valid.
+
+Please evaluate the solution and score it according to the following criteria:
+- If the solution is completely correct, with all steps executed properly and clearly demonstrated, then the score is 1
+- If the solution is generally correct, but with some details omitted or minor errors, then the score is 0.5
+- If the solution does not actually address the required problem, contains fatal errors, or has severe omissions, then the score is 0
+- Additionally, referencing anything from any paper does not save the need to prove the reference. It's okay IF AND ONLY IF the solution also presents a valid proof of the reference argument(s); otherwise, if the solution omits the proof or if the proof provided is not completely correct, the solution should be scored according to the criteria above, and definitely not with a score of 1
+
+Please carefully reason out and analyze the quality of the solution below, and in your final response present a detailed evaluation of the solution's quality followed by your score. Therefore, your response should be in the following format:
+
+Here is my evaluation of the solution:
+... // Your evaluation here. You are required to present in detail the key steps of the solution or the steps for which you had doubts regarding their correctness, and explicitly analyze whether each step is accurate: for correct steps, explain why you initially doubted their correctness and why they are indeed correct; for erroneous steps, explain the reason for the error and the impact of that error on the solution.
+
+Based on my evaluation, the final overall score should be:
+\\boxed{{...}} // where ... should be the final overall score (0, 0.5, or 1, and nothing else) based on the above criteria
+
+---
+
+Here is your task input:
+
+## Problem
+{question}
+
+## Solution
+{proof}
+""".strip()
+
+
+DEEPSEEKMATH_V2_META_JUDGE_PROMPT = r"""
+You are given a "problem", "solution", and "solution evaluation", and you need to assess the whether this "solution evaluation" is reasonable.
+
+First, "solution evaluation" is generated to evaluate the quality of the "solution", by prompting a verifier with the rules below (these are not your rules):
+
+```
+Please evaluate the solution and score it according to the following criteria:
+- If the solution is completely correct, with all steps executed properly and clearly demonstrated, then the score is 1
+- If the solution is generally correct, but with some details omitted or minor errors, then the score is 0.5
+- If the solution does not actually address the required problem, contains fatal errors, or has severe omissions, then the score is 0
+
+Additionally, referencing anything from any paper does not save the need to prove the reference. It's okay IF AND ONLY IF the solution also presents a valid proof of the reference argument(s); otherwise, if the solution omits the proof or if the proof provided is not completely correct, the solution should be scored according to the criteria above, and definitely not with a score of 1
+```
+
+Next, I will introduce the rules for you to analyze the quality of the "solution evaluation":
+
+1. Your task is to analyze the "solution evaluation". You do not need to solve the "problem", nor do you need to strictly assess whether the "solution" is accurate. Your only task is to strictly follow the rules below to evaluate whether the "solution evaluation" is reasonable.
+
+2. You need to analyze the content of the "solution evaluation" from three aspects:
+
+Step Restatement: In the "solution evaluation", certain behaviors of the "solution" may be restated. You need to return to the original text of the "solution" and check whether the "solution" actually has these behaviors mentioned in the "solution evaluation".
+
+Defect Analysis: "solution evaluation" may point out errors or defects in the "solution". You need to carefully analyze whether the mentioned errors and defects are indeed valid.
+
+Expression Analysis: Whether the "solution evaluation"'s expressions are accurate.
+
+Score Analysis: Whether the final score given by the "solution evaluation" matches the defects it found. You need to analyze according to the scoring rules given above.
+
+3. The most important part is **defect analysis**: In this part, your core task is to check whether the errors or defects of the "solution" pointed out in the "solution evaluation" are reasonable. In other words, any positive components about the "solution" in the "solution evaluation", regardless of whether they are reasonable, are not within your evaluation scope.
+
+- For example: If the "solution evaluation" says that a certain conclusion in the "solution" is correct, but actually this conclusion is incorrect, then you do not need to care about this point. All parts that the "solution evaluation" considers correct do not belong to your evaluation scope.
+- Specifically: If the "solution evaluation" believes that the "solution" is completely accurate and has not found any errors or defects, then regardless of whether the "solution" itself is actually accurate, even if there are obvious errors, you should still consider its analysis of errors to be reasonable.
+
+**Importantly**, for defects found by the "solution evaluation", you need to analyze two points simultaneously:
+
+- whether this defect actually exists
+- whether the "solution evaluation"'s analysis of this defect is accurate
+
+These two aspects constitute the analysis of defects.
+
+4. About **expression analysis**, if there are certain expression errors in the "solution evaluation", even minor errors in details, you need to identify them. However, please note that identifying incorrect steps in the "solution" as correct steps does not constitute an **expression error**.
+
+In practice, expression errors include but are not limited to:
+
+- If the "solution evaluation" identifies some reasoning step(s) in the "solution" as incorrect, then it cannot further indicate that subsequent conclusion(s) depending on those reasoning step(s) are wrong, but can only indicate that subsequent conclusion(s) are "not rigorously demonstrated."
+- Typos and calculation errors made by "solution evaluation"
+- Inaccurate restatement of content from "solution"
+
+5. Finally, you need to present your analysis of the "solution evaluation" in your output and also rate its quality based on the rules below:
+
+First, if there is at least one unreasonable defect among the defects found by the "solution evaluation", then you only need to do **defect analysis**:
+
+- If all defects found by the "solution evaluation" are unreasonable, then you should rate it with \(0\)
+- If some defects found by the "solution evaluation" are reasonable and some are unreasonable, then your rating should be \(0.5\)
+
+Next, if the "solution evaluation" points out no errors or defects, or all defects found by the evaluation are reasonable, then you should do the following things:
+
+- Analyze whether "expression errors" exist in the "solution evaluation" (**expression analysis**) or whether "solution evaluation" gives a wrong score according to the rules for "solution evaluation" (**score analysis**). If yes, you should rate the "solution evaluation" with \(0.5\); if no, your rating should be \(1\)
+
+Your output should follow the format below:
+
+Here is my analysis of the "solution evaluation":
+... // Your analysis here.
+
+Based on my analysis, I will rate the "solution evaluation" as:
+\\boxed{{...}} // where ... should be a numerical rating of the "solution evaluation" (0, 0.5, or 1, and nothing else) based on the criteria above.
+
+---
+
+Here is your task input:
+
+## Problem
+{question}
+
+## Solution
+{proof}
+
+## Solution Evaluation
+{proof analysis}
+""".strip()
+
+
+@dataclasses.dataclass
+class DeepSeekMathV2VerifierConfig(VerifierConfig):
+    llm_judge_model: str = "gpt-5.5"
+    llm_judge_base_url: str | None = None
+    llm_judge_api_key_env: str = "OPENAI_API_KEY"
+    llm_judge_api_key: str | None = None
+    deepseekmath_v2_proof_judge_model: str | None = None
+    deepseekmath_v2_meta_judge_model: str | None = None
+    deepseekmath_v2_base_url: str | None = None
+    deepseekmath_v2_api_key_env: str = "OPENAI_API_KEY"
+    deepseekmath_v2_api_key: str | None = None
+    deepseekmath_v2_proof_prompt_template: str | None = None
+    deepseekmath_v2_proof_prompt_template_file: str | None = None
+    deepseekmath_v2_meta_prompt_template: str | None = None
+    deepseekmath_v2_meta_prompt_template_file: str | None = None
+    deepseekmath_v2_max_tokens: int = 92160
+    deepseekmath_v2_max_context_length: int = 102400
+    deepseekmath_v2_temperature: float = 0.0
+    deepseekmath_v2_timeout: int = 60
+    deepseekmath_v2_proof_weight: float = 0.76
+    deepseekmath_v2_self_eval_weight: float = 0.24
+    deepseekmath_v2_enable_meta_verification: bool = True
+    deepseekmath_v2_require_format: bool = True
+    seed: int = 42
+
+    def proof_model(self) -> str:
+        return self.deepseekmath_v2_proof_judge_model or self.llm_judge_model
+
+    def meta_model(self) -> str:
+        return self.deepseekmath_v2_meta_judge_model or self.deepseekmath_v2_proof_judge_model or self.llm_judge_model
+
+    def resolved_base_url(self) -> str | None:
+        return (
+            self.deepseekmath_v2_base_url
+            or self.llm_judge_base_url
+            or os.environ.get("OPENAI_BASE_URL")
+            or os.environ.get("OPENAI_API_BASE")
+        )
+
+    def resolved_api_key(self) -> str:
+        if self.deepseekmath_v2_api_key:
+            return self.deepseekmath_v2_api_key
+        if self.llm_judge_api_key:
+            return self.llm_judge_api_key
+        env_name = self.deepseekmath_v2_api_key_env or self.llm_judge_api_key_env or "OPENAI_API_KEY"
+        api_key = os.environ.get(env_name)
+        if not api_key:
+            raise ValueError(
+                f"Missing OpenAI-compatible DeepSeekMath-V2 judge API key. Set {env_name} or pass "
+                "--deepseekmath_v2_api_key."
+            )
+        return api_key
+
+
+@dataclasses.dataclass
+class DeepSeekMathV2ParsedResponse:
+    solution: str
+    self_evaluation: str
+    self_score: float | None
+    format_ok: bool
+    format_errors: list[str]
+
+
+class DeepSeekMathV2Verifier(VerifierFunction):
+    """DeepSeekMath-V2-style proof reward with API proof and meta-verification judges."""
+
+    SCORE_VALUES = (0.0, 0.5, 1.0)
+
+    def __init__(self, verifier_config: DeepSeekMathV2VerifierConfig) -> None:
+        super().__init__("deepseekmath_v2", verifier_config=verifier_config, weight=1.0)
+        self.config = verifier_config
+        self.proof_prompt_template = self._load_template(
+            verifier_config.deepseekmath_v2_proof_prompt_template,
+            verifier_config.deepseekmath_v2_proof_prompt_template_file,
+            DEEPSEEKMATH_V2_PROOF_JUDGE_PROMPT,
+        )
+        self.meta_prompt_template = self._load_template(
+            verifier_config.deepseekmath_v2_meta_prompt_template,
+            verifier_config.deepseekmath_v2_meta_prompt_template_file,
+            DEEPSEEKMATH_V2_META_JUDGE_PROMPT,
+        )
+
+    @staticmethod
+    def _load_template(inline_template: str | None, template_file: str | None, default_template: str) -> str:
+        if template_file:
+            with open(template_file, encoding="utf-8") as file_obj:
+                return file_obj.read()
+        return inline_template or default_template
+
+    @staticmethod
+    def _render_template(template: str, values: dict[str, Any]) -> str:
+        rendered = template
+        for key, value in values.items():
+            rendered = rendered.replace("{" + key + "}", "" if value is None else str(value))
+        return rendered
+
+    @classmethod
+    def _normalize_score(cls, value: Any) -> float | None:
+        try:
+            score = float(value)
+        except (TypeError, ValueError):
+            return None
+        nearest = min(cls.SCORE_VALUES, key=lambda allowed: abs(allowed - score))
+        if abs(nearest - score) <= 1e-6:
+            return nearest
+        return None
+
+    @classmethod
+    def _extract_score(cls, text: str | None) -> float | None:
+        if not text:
+            return None
+        boxed_matches = re.findall(r"\\boxed\s*\{+\s*([-+]?(?:\d+(?:\.\d+)?|\.\d+))\s*\}+", text)
+        for value in reversed(boxed_matches):
+            parsed = cls._normalize_score(value)
+            if parsed is not None:
+                return parsed
+
+        if "{" in text and "}" in text:
+            obj = extract_json_from_response(text)
+            if isinstance(obj, dict):
+                for key in ("score", "SCORE", "rating", "RATING"):
+                    if key in obj:
+                        parsed = cls._normalize_score(obj[key])
+                        if parsed is not None:
+                            return parsed
+
+        score_matches = re.findall(r"(?i)\b(?:score|rating)\b[^0-9+-]*([-+]?(?:\d+(?:\.\d+)?|\.\d+))", text)
+        for value in reversed(score_matches):
+            parsed = cls._normalize_score(value)
+            if parsed is not None:
+                return parsed
+        return None
+
+    @staticmethod
+    def _extract_sections(prediction: str) -> tuple[str, str, list[str]]:
+        errors: list[str] = []
+        solution_match = re.search(r"(?im)^[ \t]*##[ \t]+Solution[ \t]*$", prediction)
+        self_eval_match = re.search(r"(?im)^[ \t]*##[ \t]+Self[ \t]+Evaluation[ \t]*$", prediction)
+
+        if not solution_match:
+            errors.append("missing_solution_heading")
+        if not self_eval_match:
+            errors.append("missing_self_evaluation_heading")
+        if solution_match and self_eval_match and self_eval_match.start() <= solution_match.start():
+            errors.append("self_evaluation_before_solution")
+
+        if solution_match and self_eval_match and self_eval_match.start() > solution_match.start():
+            solution = prediction[solution_match.end() : self_eval_match.start()].strip()
+            self_evaluation = prediction[self_eval_match.end() :].strip()
+        else:
+            solution = prediction.strip()
+            self_evaluation = ""
+
+        if not solution:
+            errors.append("empty_solution")
+        if not self_evaluation:
+            errors.append("empty_self_evaluation")
+        return solution, self_evaluation, errors
+
+    @classmethod
+    def parse_prediction(cls, prediction: str) -> DeepSeekMathV2ParsedResponse:
+        solution, self_evaluation, errors = cls._extract_sections(prediction)
+        if self_evaluation and "Here is my evaluation of the solution:" not in self_evaluation:
+            errors.append("missing_evaluation_phrase")
+        if self_evaluation and "Based on my evaluation, the final overall score should be:" not in self_evaluation:
+            errors.append("missing_score_phrase")
+        self_score = cls._extract_score(self_evaluation)
+        if self_score is None:
+            errors.append("missing_or_invalid_boxed_self_score")
+        return DeepSeekMathV2ParsedResponse(
+            solution=solution,
+            self_evaluation=self_evaluation,
+            self_score=self_score,
+            format_ok=not errors,
+            format_errors=errors,
+        )
+
+    @staticmethod
+    def _resolve_problem(label: Any, query: str | None) -> str:
+        if query:
+            return query
+        if isinstance(label, str):
+            try:
+                parsed = json.loads(label)
+            except json.JSONDecodeError:
+                return label
+            label = parsed
+        if isinstance(label, dict):
+            for key in ("query", "question", "problem", "Question", "Problem"):
+                value = label.get(key)
+                if value:
+                    return str(value)
+        return "" if label is None else str(label)
+
+    @staticmethod
+    def _response_cost(response: Any, model: str) -> float:
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return 0.0
+        model_name = model.split("/")[-1].replace("-standard", "")
+        return (
+            PRICE_PER_MILLION_TOKENS.get(model_name, {}).get("input", 0) * usage.prompt_tokens
+            + PRICE_PER_MILLION_TOKENS.get(model_name, {}).get("output", 0) * usage.completion_tokens
+        ) / 1_000_000
+
+    async def _call_judge(self, prompt: str, model: str) -> tuple[str, float]:
+        messages = build_messages(prompt)
+        if not context_window_checker.check_context_window_limit(
+            messages=messages,
+            max_completion_tokens=self.config.deepseekmath_v2_max_tokens,
+            model_name=model,
+            max_context_length=self.config.deepseekmath_v2_max_context_length,
+            safety_margin=150,
+        ):
+            messages = context_window_checker.truncate_messages_to_fit_context(
+                messages=messages,
+                max_completion_tokens=self.config.deepseekmath_v2_max_tokens,
+                model_name=model,
+                max_context_length=self.config.deepseekmath_v2_max_context_length,
+                safety_margin=200,
+            )
+
+        client = LMJudgeVerifier._client_for_values(
+            self.config.resolved_base_url(),
+            self.config.resolved_api_key(),
+            self.config.deepseekmath_v2_timeout,
+        )
+        response = await client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=self.config.deepseekmath_v2_temperature,
+            max_completion_tokens=self.config.deepseekmath_v2_max_tokens,
+            timeout=self.config.deepseekmath_v2_timeout,
+        )
+        content = response.choices[0].message.content or ""
+        return content, self._response_cost(response, model)
+
+    async def async_call(
+        self,
+        tokenized_prediction: list[int],
+        prediction: str,
+        label: Any,
+        query: str | None = None,
+        rollout_state: dict | None = None,
+    ) -> VerificationResult:
+        parsed = self.parse_prediction(prediction)
+        if self.config.deepseekmath_v2_require_format and not parsed.format_ok:
+            return VerificationResult(
+                score=0.0,
+                reasoning=json.dumps(
+                    {
+                        "format_ok": False,
+                        "format_errors": parsed.format_errors,
+                        "proof_score": None,
+                        "self_score": parsed.self_score,
+                        "self_eval_score": None,
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+
+        question = self._resolve_problem(label, query)
+        values = {
+            "question": question,
+            "proof": parsed.solution,
+            "solution": parsed.solution,
+            "proof_analysis": parsed.self_evaluation,
+            "proof analysis": parsed.self_evaluation,
+            "self_evaluation": parsed.self_evaluation,
+            "prediction": prediction,
+            "label": label,
+        }
+
+        total_cost = 0.0
+        try:
+            proof_content, proof_cost = await self._call_judge(
+                self._render_template(self.proof_prompt_template, values),
+                self.config.proof_model(),
+            )
+            total_cost += proof_cost
+            proof_score = self._extract_score(proof_content)
+            if proof_score is None:
+                return VerificationResult(
+                    score=0.0,
+                    cost=total_cost,
+                    reasoning=json.dumps(
+                        {
+                            "format_ok": parsed.format_ok,
+                            "format_errors": parsed.format_errors,
+                            "error": "missing_or_invalid_proof_judge_score",
+                            "proof_judge_response": proof_content[:1000],
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+
+            if not self.config.deepseekmath_v2_enable_meta_verification:
+                reward = proof_score if parsed.format_ok or not self.config.deepseekmath_v2_require_format else 0.0
+                return VerificationResult(
+                    score=reward,
+                    cost=total_cost,
+                    reasoning=json.dumps(
+                        {
+                            "format_ok": parsed.format_ok,
+                            "format_errors": parsed.format_errors,
+                            "proof_score": proof_score,
+                            "self_score": parsed.self_score,
+                            "self_eval_score": None,
+                            "score_alignment": None,
+                            "meta_verification_enabled": False,
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+
+            meta_content, meta_cost = await self._call_judge(
+                self._render_template(self.meta_prompt_template, values),
+                self.config.meta_model(),
+            )
+            total_cost += meta_cost
+            self_eval_score = self._extract_score(meta_content)
+            if self_eval_score is None:
+                self_eval_score = 0.0
+            self_score = parsed.self_score if parsed.self_score is not None else 0.0
+            score_alignment = max(0.0, 1.0 - abs(self_score - proof_score))
+            format_multiplier = 1.0 if parsed.format_ok or not self.config.deepseekmath_v2_require_format else 0.0
+            reward = format_multiplier * (
+                self.config.deepseekmath_v2_proof_weight * proof_score
+                + self.config.deepseekmath_v2_self_eval_weight * score_alignment * self_eval_score
+            )
+            reward = max(0.0, min(1.0, reward))
+
+            return VerificationResult(
+                score=reward,
+                cost=total_cost,
+                reasoning=json.dumps(
+                    {
+                        "format_ok": parsed.format_ok,
+                        "format_errors": parsed.format_errors,
+                        "proof_score": proof_score,
+                        "self_score": parsed.self_score,
+                        "self_eval_score": self_eval_score,
+                        "score_alignment": score_alignment,
+                        "reward": reward,
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+        except Exception as exc:
+            logger.warning("DeepSeekMath-V2 verifier failed: %s", exc)
+            return VerificationResult(score=0.0, cost=total_cost, reasoning=f"Error: {exc}")
+
+    def __call__(
+        self,
+        tokenized_prediction: list[int],
+        prediction: str,
+        label: Any,
+        query: str | None = None,
+        rollout_state: dict | None = None,
+    ) -> VerificationResult:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self.async_call(tokenized_prediction, prediction, label, query, rollout_state))
+        raise RuntimeError("Cannot call synchronous method from async context. Use async_call instead.")
+
+    @classmethod
+    def get_config_class(cls) -> type:
+        return DeepSeekMathV2VerifierConfig
+
+
 class CodeVerifier(VerifierFunction):
     """
     Verifier that executes Python code against test cases using an external API.

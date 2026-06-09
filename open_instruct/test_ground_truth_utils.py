@@ -4,6 +4,7 @@ Test script for verifier functionality in Python
 """
 
 import asyncio
+import dataclasses
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -12,6 +13,8 @@ from parameterized import parameterized
 
 from open_instruct import ground_truth_utils
 from open_instruct.ground_truth_utils import (
+    DeepSeekMathV2Verifier,
+    DeepSeekMathV2VerifierConfig,
     F1Verifier,
     GSM8KVerifier,
     LMJudgeVerifier,
@@ -313,6 +316,141 @@ class TestRubricVerifier(unittest.TestCase):
         )
         self.assertEqual(create_mock.await_args.kwargs["model"], "rubric-model")
         self.assertEqual(create_mock.await_args.kwargs["max_completion_tokens"], 128)
+
+
+class TestDeepSeekMathV2Verifier(unittest.TestCase):
+    def setUp(self):
+        LMJudgeVerifier._clients.clear()
+        self.config = DeepSeekMathV2VerifierConfig(
+            llm_judge_model="judge-model",
+            llm_judge_base_url="https://example.test/v1",
+            llm_judge_api_key="test-key",
+            deepseekmath_v2_max_tokens=128,
+            deepseekmath_v2_max_context_length=4096,
+            deepseekmath_v2_temperature=0.0,
+            deepseekmath_v2_timeout=30,
+        )
+        self.verifier = DeepSeekMathV2Verifier(self.config)
+
+    @staticmethod
+    def formatted_prediction(self_score: str = "0.5") -> str:
+        return f"""## Solution
+This is a proof attempt.
+
+## Self Evaluation
+
+Here is my evaluation of the solution:
+The proof has one minor gap.
+
+Based on my evaluation, the final overall score should be:
+\\boxed{{{self_score}}}
+"""
+
+    def test_async_call_computes_weighted_proof_and_meta_reward(self):
+        create_mock = AsyncMock(
+            side_effect=[
+                _make_openai_response('{"reasoning":"proof ok","score":1}'),
+                _make_openai_response('{"reasoning":"self eval partly ok","score":0.5}'),
+            ]
+        )
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create_mock)),
+            close=AsyncMock(),
+        )
+
+        with (
+            patch("open_instruct.ground_truth_utils.AsyncOpenAI", return_value=client) as client_cls,
+            patch(
+                "open_instruct.ground_truth_utils.context_window_checker.check_context_window_limit",
+                return_value=True,
+            ),
+        ):
+            result = asyncio.run(
+                self.verifier.async_call(
+                    tokenized_prediction=[],
+                    prediction=self.formatted_prediction("0.5"),
+                    label={"problem": "prove this"},
+                    query=None,
+                )
+            )
+
+        self.assertAlmostEqual(result.score, 0.82)
+        payload = ground_truth_utils.json.loads(result.reasoning)
+        self.assertEqual(payload["proof_score"], 1.0)
+        self.assertEqual(payload["self_score"], 0.5)
+        self.assertEqual(payload["self_eval_score"], 0.5)
+        self.assertEqual(payload["score_alignment"], 0.5)
+        self.assertEqual(create_mock.await_count, 2)
+        client_cls.assert_called_once_with(api_key="test-key", base_url="https://example.test/v1", timeout=30)
+        self.assertEqual(create_mock.await_args_list[0].kwargs["model"], "judge-model")
+
+    def test_async_call_returns_zero_without_required_format(self):
+        create_mock = AsyncMock()
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create_mock)),
+            close=AsyncMock(),
+        )
+
+        with patch("open_instruct.ground_truth_utils.AsyncOpenAI", return_value=client):
+            result = asyncio.run(
+                self.verifier.async_call(
+                    tokenized_prediction=[],
+                    prediction="This proof has no required headings.",
+                    label={"problem": "prove this"},
+                    query=None,
+                )
+            )
+
+        self.assertEqual(result.score, 0.0)
+        self.assertEqual(create_mock.await_count, 0)
+        payload = ground_truth_utils.json.loads(result.reasoning)
+        self.assertFalse(payload["format_ok"])
+        self.assertIn("missing_solution_heading", payload["format_errors"])
+
+    def test_async_call_can_run_proof_score_only(self):
+        config = dataclasses.replace(self.config, deepseekmath_v2_enable_meta_verification=False)
+        verifier = DeepSeekMathV2Verifier(config)
+        create_mock = AsyncMock(return_value=_make_openai_response('{"reasoning":"minor gap","score":0.5}'))
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create_mock)),
+            close=AsyncMock(),
+        )
+
+        with (
+            patch("open_instruct.ground_truth_utils.AsyncOpenAI", return_value=client),
+            patch(
+                "open_instruct.ground_truth_utils.context_window_checker.check_context_window_limit",
+                return_value=True,
+            ),
+        ):
+            result = asyncio.run(
+                verifier.async_call(
+                    tokenized_prediction=[],
+                    prediction=self.formatted_prediction("0.5"),
+                    label={"problem": "prove this"},
+                    query=None,
+                )
+            )
+
+        self.assertEqual(result.score, 0.5)
+        self.assertEqual(create_mock.await_count, 1)
+
+    def test_default_prompts_follow_deepseekmath_v2_appendix_format(self):
+        self.assertIn("Here is my evaluation of the solution:", ground_truth_utils.DEEPSEEKMATH_V2_PROOF_JUDGE_PROMPT)
+        self.assertIn(
+            "Based on my evaluation, the final overall score should be:",
+            ground_truth_utils.DEEPSEEKMATH_V2_PROOF_JUDGE_PROMPT,
+        )
+        self.assertIn(r"\\boxed{{...}}", ground_truth_utils.DEEPSEEKMATH_V2_PROOF_JUDGE_PROMPT)
+        self.assertIn(
+            'Here is my analysis of the "solution evaluation":',
+            ground_truth_utils.DEEPSEEKMATH_V2_META_JUDGE_PROMPT,
+        )
+        self.assertIn(
+            'Based on my analysis, I will rate the "solution evaluation" as:',
+            ground_truth_utils.DEEPSEEKMATH_V2_META_JUDGE_PROMPT,
+        )
+        self.assertIn("{proof analysis}", ground_truth_utils.DEEPSEEKMATH_V2_META_JUDGE_PROMPT)
 
 
 class TestIFEvalVerifierEmptyInstructions(unittest.TestCase):
