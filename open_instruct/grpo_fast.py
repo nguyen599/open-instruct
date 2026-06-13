@@ -2392,7 +2392,7 @@ def main(
     utils.check_runtime_leaks()
 
 
-if __name__ == "__main__":
+def cli_main() -> None:
     utils.check_oe_eval_internal()
 
     parser = ArgumentParserPlus(
@@ -2417,3 +2417,7 @@ if __name__ == "__main__":
     assert isinstance(tools_config, EnvsConfig)
 
     main(args, tokenizer_config, model_config, streaming_config, vllm_config, tools_config)
+
+
+if __name__ == "__main__":
+    cli_main()
