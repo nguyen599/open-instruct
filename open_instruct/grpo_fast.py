@@ -295,32 +295,44 @@ class PolicyTrainerRayProcess(RayProcess):
         # Keep heavyweight DeepSpeed/Transformers objects as local imports so
         # Ray does not try to pickle module-level config state when exporting
         # this actor method.
-        import deepspeed as local_deepspeed  # noqa: PLC0415
-        from deepspeed.runtime.sequence_parallel.ulysses_sp import UlyssesSPAttentionHF as LocalUlyssesSPAttentionHF  # noqa: PLC0415
-        from deepspeed.utils import groups as local_groups  # noqa: PLC0415
-        from transformers import AutoModelForCausalLM as LocalAutoModelForCausalLM  # noqa: PLC0415
-        from transformers import get_scheduler as local_get_scheduler  # noqa: PLC0415
-        from transformers.integrations import HfDeepSpeedConfig as LocalHfDeepSpeedConfig  # noqa: PLC0415
-        from open_instruct import model_utils as local_model_utils  # noqa: PLC0415
-        from open_instruct import utils as local_utils  # noqa: PLC0415
-        from open_instruct.model_utils import disable_dropout_in_model as local_disable_dropout_in_model  # noqa: PLC0415
-        from open_instruct.model_utils import load_ref_policy as local_load_ref_policy  # noqa: PLC0415
-        from open_instruct.utils import UlyssesSPSplitter as LocalUlyssesSPSplitter  # noqa: PLC0415
-        from open_instruct.utils import get_eval_ds_config as local_get_eval_ds_config  # noqa: PLC0415
-        from open_instruct.utils import get_optimizer_grouped_parameters as local_get_optimizer_grouped_parameters  # noqa: PLC0415
-        from open_instruct.utils import get_train_ds_config as local_get_train_ds_config  # noqa: PLC0415
+        local_deepspeed = __import__("deepspeed")
+        local_ulysses_module = __import__(
+            "deepspeed.runtime.sequence_parallel.ulysses_sp",
+            fromlist=["UlyssesSPAttentionHF"],
+        )
+        LocalUlyssesSPAttentionHF = getattr(local_ulysses_module, "UlyssesSPAttentionHF")
+        local_groups = __import__("deepspeed.utils", fromlist=["groups"]).groups
+        local_transformers = __import__("transformers", fromlist=["AutoModelForCausalLM", "get_scheduler"])
+        LocalAutoModelForCausalLM = getattr(local_transformers, "AutoModelForCausalLM")
+        local_get_scheduler = getattr(local_transformers, "get_scheduler")
+        local_transformers_integrations = __import__(
+            "transformers.integrations",
+            fromlist=["HfDeepSpeedConfig"],
+        )
+        LocalHfDeepSpeedConfig = getattr(local_transformers_integrations, "HfDeepSpeedConfig")
+        local_model_utils = __import__("open_instruct.model_utils", fromlist=[""])
+        local_utils = __import__("open_instruct.utils", fromlist=[""])
+        local_disable_dropout_in_model = getattr(local_model_utils, "disable_dropout_in_model")
+        local_load_ref_policy = getattr(local_model_utils, "load_ref_policy")
+        LocalUlyssesSPSplitter = getattr(local_utils, "UlyssesSPSplitter")
+        local_get_eval_ds_config = getattr(local_utils, "get_eval_ds_config")
+        local_get_optimizer_grouped_parameters = getattr(local_utils, "get_optimizer_grouped_parameters")
+        local_get_train_ds_config = getattr(local_utils, "get_train_ds_config")
 
         # ------------------------------------------------------------
         # Monkey patch to load checkpoints with `weights_only=False`
         # otherwise it errors out with:
         # `_pickle.UnpicklingError: Weights only load failed. ` with pytorch 2.6.0
-        from deepspeed.runtime.checkpoint_engine import torch_checkpoint_engine  # noqa: PLC0415
-        from deepspeed.utils import logger  # noqa: PLC0415
+        torch_checkpoint_engine = __import__(
+            "deepspeed.runtime.checkpoint_engine",
+            fromlist=["torch_checkpoint_engine"],
+        ).torch_checkpoint_engine
+        local_ds_logger = __import__("deepspeed.utils", fromlist=["logger"]).logger
 
         def load(self, path: str, map_location=None):
-            logger.info(f"[Torch] Loading checkpoint from {path}...")
+            local_ds_logger.info(f"[Torch] Loading checkpoint from {path}...")
             partition = torch.load(path, map_location=map_location, weights_only=False)
-            logger.info(f"[Torch] Loaded checkpoint from {path}.")
+            local_ds_logger.info(f"[Torch] Loaded checkpoint from {path}.")
             return partition
 
         torch_checkpoint_engine.TorchCheckpointEngine.load = load
@@ -371,7 +383,7 @@ class PolicyTrainerRayProcess(RayProcess):
             dschf = None
         logger.info(f"Deepspeed config: {dschf=}")
 
-        self.policy: PreTrainedModel = LocalAutoModelForCausalLM.from_pretrained(
+        self.policy = LocalAutoModelForCausalLM.from_pretrained(
             model_config.model_name_or_path,
             revision=model_config.model_revision,
             dtype=torch.bfloat16,
@@ -475,7 +487,7 @@ class PolicyTrainerRayProcess(RayProcess):
                 per_device_train_batch_size=args.per_device_train_batch_size,
             )
 
-            self.ref_policy: PreTrainedModel = local_load_ref_policy(
+            self.ref_policy = local_load_ref_policy(
                 model_config=model_config,
                 ds_config=ds_config,
                 deepspeed_stage=args.deepspeed_stage,
