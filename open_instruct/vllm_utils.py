@@ -791,13 +791,30 @@ class LLMRayActor:
     def wake_up(self) -> None:
         return self._run_async(self.llm_engine.wake_up(tags=["scheduling"]))
 
+    async def _update_weights_async(self, update_info: WeightUpdateRPCArgs) -> None:
+        request = WeightTransferUpdateRequest(**update_info)
+        start_weight_update = getattr(self.llm_engine, "start_weight_update", None)
+        finish_weight_update = getattr(self.llm_engine, "finish_weight_update", None)
+        if start_weight_update is None:
+            await self.llm_engine.update_weights(request)
+            return
+
+        # vLLM >=0.21 requires an explicit start/update/finish handshake for
+        # streamed trainer weights. Older vLLM versions only expose update_weights.
+        await start_weight_update(is_checkpoint_format=False)
+        try:
+            await self.llm_engine.update_weights(request)
+        finally:
+            if finish_weight_update is not None:
+                await finish_weight_update()
+
     def update_weights(self, update_info: WeightUpdateRPCArgs, model_step: int | None = None) -> None:
         # IPCWeightTransferEngine.trainer_send_weights (vllm) calls this RPC with
         # `dict(update_info=...)` and no model_step; NCCL callers pass model_step explicitly.
         while not self.inflight_updates and len(self.active_tasks) > 0:
             self.check_background_threads()
             time.sleep(DRAIN_ACTIVE_TASKS_SLEEP_S)
-        self._run_async(self.llm_engine.update_weights(WeightTransferUpdateRequest(**update_info)))
+        self._run_async(self._update_weights_async(update_info))
         if model_step is not None:
             self.current_model_step = model_step
 
