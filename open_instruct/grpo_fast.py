@@ -264,7 +264,10 @@ class PolicyTrainerRayProcess(RayProcess):
         vllm_config: data_loader_lib.VLLMConfig,
         tokenizer: PreTrainedTokenizer,
     ):
-        super().__init__(world_size, rank, local_rank, master_addr, master_port)
+        # Avoid a zero-argument super() __class__ closure here. Ray/cloudpickle
+        # serializes the actor constructor and can otherwise recurse into the
+        # actor class, which includes PyTorch config state that is not picklable.
+        RayProcess.__init__(self, world_size, rank, local_rank, master_addr, master_port)
         self.tokenizer = tokenizer
         self.pad_token_id = tokenizer.pad_token_id
         self.num_mini_batches = args.num_mini_batches
