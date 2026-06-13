@@ -249,6 +249,263 @@ def wait_for_grpo_fast_placement_group(
             + _startup_debug_context(args, requirements, cluster_resources, available_resources)
         ) from exc
 
+def _policy_trainer_ray_process_from_pretrained_impl(
+    self,
+    args: grpo_utils.GRPOExperimentConfig,
+    model_config: ModelConfig,
+    beaker_config: BeakerRuntimeConfig,
+    wandb_url: str,
+    tokenizer: PreTrainedTokenizer,
+) -> dict[str, Any]:
+    # Keep heavyweight DeepSpeed/Transformers objects as local imports so
+    # Ray does not try to pickle module-level config state when exporting
+    # this actor method.
+    local_deepspeed = __import__("deepspeed")
+    local_ulysses_module = __import__(
+        "deepspeed.runtime.sequence_parallel.ulysses_sp",
+        fromlist=["UlyssesSPAttentionHF"],
+    )
+    LocalUlyssesSPAttentionHF = getattr(local_ulysses_module, "UlyssesSPAttentionHF")
+    local_groups = __import__("deepspeed.utils", fromlist=["groups"]).groups
+    local_transformers = __import__("transformers", fromlist=["AutoModelForCausalLM", "get_scheduler"])
+    LocalAutoModelForCausalLM = getattr(local_transformers, "AutoModelForCausalLM")
+    local_get_scheduler = getattr(local_transformers, "get_scheduler")
+    local_transformers_integrations = __import__(
+        "transformers.integrations",
+        fromlist=["HfDeepSpeedConfig"],
+    )
+    LocalHfDeepSpeedConfig = getattr(local_transformers_integrations, "HfDeepSpeedConfig")
+    local_model_utils = __import__("open_instruct.model_utils", fromlist=[""])
+    local_utils = __import__("open_instruct.utils", fromlist=[""])
+    local_disable_dropout_in_model = getattr(local_model_utils, "disable_dropout_in_model")
+    local_load_ref_policy = getattr(local_model_utils, "load_ref_policy")
+    LocalUlyssesSPSplitter = getattr(local_utils, "UlyssesSPSplitter")
+    local_get_eval_ds_config = getattr(local_utils, "get_eval_ds_config")
+    local_get_optimizer_grouped_parameters = getattr(local_utils, "get_optimizer_grouped_parameters")
+    local_get_train_ds_config = getattr(local_utils, "get_train_ds_config")
+    local_logger = __import__("logging").getLogger(__name__)
+
+    # ------------------------------------------------------------
+    # Monkey patch to load checkpoints with `weights_only=False`
+    # otherwise it errors out with:
+    # `_pickle.UnpicklingError: Weights only load failed. ` with pytorch 2.6.0
+    torch_checkpoint_engine = __import__(
+        "deepspeed.runtime.checkpoint_engine",
+        fromlist=["torch_checkpoint_engine"],
+    ).torch_checkpoint_engine
+    local_ds_logger = __import__("deepspeed.utils", fromlist=["logger"]).logger
+
+    def load(self, path: str, map_location=None):
+        local_ds_logger.info(f"[Torch] Loading checkpoint from {path}...")
+        partition = torch.load(path, map_location=map_location, weights_only=False)
+        local_ds_logger.info(f"[Torch] Loaded checkpoint from {path}.")
+        return partition
+
+    torch_checkpoint_engine.TorchCheckpointEngine.load = load
+
+    # ------------------------------------------------------------
+    self.args = args
+    self.tokenizer = tokenizer
+    self.model_config = model_config
+    self.beaker_config = beaker_config
+    self.wandb_url = wandb_url
+    torch.cuda.set_device(self.local_rank)
+    self.device = torch.device(self.local_rank)
+
+    # Set seeds for this worker (different per rank to avoid correlation)
+    worker_seed = args.seed + self.local_rank
+    torch.manual_seed(worker_seed)
+    torch.cuda.manual_seed(worker_seed)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+    # Pre-initialize torch.distributed WITHOUT device_id to avoid NCCL hangs.
+    # DeepSpeed 0.17.3 and up sets device_id in init_process_group which can cause hangs
+    # when multiple process groups exist (e.g., for weight sync to vLLM).
+    # By initializing first, DeepSpeed will detect it and wrap it instead of re-initializing.
+    if not torch.distributed.is_initialized():
+        torch.distributed.init_process_group(backend="nccl", timeout=timedelta(minutes=args.backend_timeout))
+    local_deepspeed.init_distributed(timeout=timedelta(minutes=args.backend_timeout))
+
+    ds_config = local_get_train_ds_config(
+        offload=args.deepspeed_offload_param,
+        adam_offload=args.deepspeed_offload_optimizer,
+        stage=args.deepspeed_stage,
+        bf16=True,
+        max_norm=args.max_grad_norm if args.max_grad_norm is not None else 0.0,
+        zpg=args.deepspeed_zpg,
+        sequence_parallel_size=args.sequence_parallel_size,
+    )
+    ds_config["train_micro_batch_size_per_gpu"] = args.per_device_train_batch_size
+    ds_config["gradient_accumulation_steps"] = 1
+    ds_config["checkpoint"] = {"load_universal": args.deepspeed_checkpoint_load_universal}
+    # @vwxyzjn: MAGIC: it's actually needed to initialize this `dschf`, so
+    # https://huggingface.co/docs/transformers/deepspeed#non-trainer-deepspeed-integration
+    # next line instructs transformers to partition the model directly over multiple gpus using
+    # deepspeed.zero.Init when model's `from_pretrained` method is called.
+    if ds_config is not None and ds_config["zero_optimization"]["stage"] == 3:
+        dschf = LocalHfDeepSpeedConfig(ds_config)
+    else:
+        dschf = None
+    local_logger.info(f"Deepspeed config: {dschf=}")
+
+    self.policy = LocalAutoModelForCausalLM.from_pretrained(
+        model_config.model_name_or_path,
+        revision=model_config.model_revision,
+        dtype=torch.bfloat16,
+        attn_implementation=local_model_utils.olmo_core_attn_to_hf(model_config.attn_implementation),
+        **({"device_map": {"": self.local_rank}} if args.deepspeed_stage != 3 else {}),
+    )
+    self.mpu = LocalUlyssesSPAttentionHF.register_with_transformers(
+        model_name_or_path=self.policy,
+        core_attn_implementation=local_model_utils.olmo_core_attn_to_hf(model_config.attn_implementation),
+        sequence_parallel_size=args.sequence_parallel_size,
+        micro_batch_size=args.per_device_train_batch_size,
+        seq_length_is_variable=True,
+    )
+    self._model_name_or_path = model_config.model_name_or_path
+    self.policy.config.use_cache = False
+    local_disable_dropout_in_model(self.policy)
+    self.policy.gradient_checkpointing_enable()
+    if args.set_weight_decay_on_bias_and_norm:
+        optim_params = local_get_optimizer_grouped_parameters(self.policy, args.weight_decay)
+    else:
+        optim_params = self.policy.parameters()
+    self.optimizer = torch.optim.AdamW(optim_params, lr=args.learning_rate, fused=args.fused_optimizer)
+    num_scheduler_steps = args.num_training_steps * args.num_epochs * args.num_mini_batches
+    warmup_steps = int(num_scheduler_steps * args.warmup_ratio)
+    scheduler = local_get_scheduler(
+        args.lr_scheduler_type,
+        optimizer=self.optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=num_scheduler_steps,
+    )
+    self.model, self.optimizer, _, self.scheduler = local_deepspeed.initialize(
+        model=self.policy,
+        optimizer=self.optimizer,
+        config=ds_config,
+        lr_scheduler=scheduler,
+        dist_init_required=False,
+        mpu=self.mpu,
+    )
+    optimization_steps_done = 0
+    checkpoint_state = None
+    if args.checkpoint_state_dir:
+        # check if the dir exists
+        if not os.path.exists(args.checkpoint_state_dir):
+            local_logger.warning(
+                f"Skipping loading checkpoint state from {args.checkpoint_state_dir} because it does not exist!"
+            )
+        else:
+            # remove mpu for loading checkpoints, add it back after loading
+            old_mpu = self.mpu
+            self.model.mpu = None
+            path, states = self.model.load_checkpoint(
+                args.checkpoint_state_dir,
+                load_module_strict=True,
+                load_optimizer_states=True,
+                load_lr_scheduler_states=True,
+                load_module_only=False,
+            )
+            self.model.mpu = old_mpu
+            if path is None:
+                raise ValueError(f"Failed to load checkpoint from {args.checkpoint_state_dir}")
+            checkpoint_state = states
+            optimization_steps_done = states["training_step"]
+
+            rng_states = states["rng_states"]
+            torch.set_rng_state(rng_states["torch_cpu_rng_state"])
+            np.random.set_state(rng_states["numpy_rng_state"])
+            random.setstate(rng_states["python_rng_state"])
+
+            if torch.cuda.is_available() and "torch_cuda_rng_states" in rng_states:
+                # device_str, e.g. "cuda:0"
+                for device_str, rng_state in rng_states["torch_cuda_rng_states"].items():
+                    device_id = int(device_str.split(":")[1])
+                    torch.cuda.set_rng_state(rng_state, device_id)
+                if "torch_cuda_rng_state_all" in rng_states:
+                    torch.cuda.set_rng_state_all(rng_states["torch_cuda_rng_state_all"])
+
+            local_logger.info(f"{self.rank=}: Restored RNG states from checkpoint")
+
+            # Save reference policy path to load later (after ref_policy is initialized)
+            self.ref_policy_checkpoint_path = None
+            if args.load_ref_policy and states.get("ref_policy_saved", False):
+                ref_policy_dir = os.path.join(args.checkpoint_state_dir, "ref_policy")
+                model_path = os.path.join(ref_policy_dir, "pytorch_model.bin")
+                if os.path.exists(model_path):
+                    self.ref_policy_checkpoint_path = model_path
+                    local_logger.info(f"{self.rank=}: Will load reference policy from {model_path}")
+
+            local_logger.info(
+                f"{self.rank=}: Loaded checkpoint from {args.checkpoint_state_dir} with {optimization_steps_done=}"
+            )
+    self.model.train()
+
+    # reference model
+    if args.load_ref_policy:
+        ds_config, self.ref_policy_hf_ds_config = local_get_eval_ds_config(
+            offload=False,
+            # inference model only has stage 3 (sharding) or stage 0 (no sharding)
+            # stage 2 is optimizer sharding which doesn't apply to inference
+            stage=args.deepspeed_stage if args.deepspeed_stage == 3 else 0,
+            bf16=True,
+            per_device_train_batch_size=args.per_device_train_batch_size,
+        )
+
+        self.ref_policy = local_load_ref_policy(
+            model_config=model_config,
+            ds_config=ds_config,
+            deepspeed_stage=args.deepspeed_stage,
+            local_rank=self.local_rank,
+            device=self.device,
+            rank=self.rank,
+            checkpoint_path=self.ref_policy_checkpoint_path
+            if hasattr(self, "ref_policy_checkpoint_path")
+            else None,
+            mpu=self.mpu,
+            ref_policy_update_freq=args.ref_policy_update_freq,
+            alpha=args.alpha,
+        )
+    self.local_metrics = local_utils.MetricsTracker(max_metrics=512, device=self.device)
+
+    if self.mpu is not None:
+        self.splitter = LocalUlyssesSPSplitter(
+            sp_rank=local_groups._get_sequence_parallel_rank(),
+            sp_group=local_groups._get_sequence_parallel_group(),
+            sp_world_size=local_groups._get_sequence_parallel_world_size(),
+            device=self.device,
+            pad_token_id=self.tokenizer.pad_token_id,
+        )
+    else:
+        self.splitter = None
+
+    # dp_rank = which data-parallel group this worker belongs to
+    # With SP, workers in the same SP group share the same dp_rank
+    dp_rank = self.rank // args.sequence_parallel_size
+    assert dp_rank < self.dp_world_size
+
+    # Verify SP groups are consecutive as we assume for above logic (e.g., [0,1,2,3], [4,5,6,7], ...)
+    # getting the dp_rank directly does not work right now with the mpus :/
+    if self.mpu is not None:
+        sp_group = local_groups._get_sequence_parallel_group()
+        sp_ranks = sorted(torch.distributed.get_process_group_ranks(sp_group))
+        expected = list(range(dp_rank * args.sequence_parallel_size, (dp_rank + 1) * args.sequence_parallel_size))
+        assert sp_ranks == expected, f"SP group {sp_ranks} != expected {expected}"
+
+    self._streaming_dataloader = self.streaming_config.build_dataloader(
+        tokenizer=tokenizer,
+        dp_rank=dp_rank,
+        fs_local_rank=self.local_rank,
+        num_training_steps=args.num_training_steps,
+        work_dir=args.output_dir,
+        dp_world_size=self.dp_world_size,
+    )
+    self.dataloader = iter(self._streaming_dataloader)
+
+    return {"optimization_steps_done": optimization_steps_done, "checkpoint_state": checkpoint_state}
+
+
 
 @ray.remote(num_gpus=1)
 class PolicyTrainerRayProcess(RayProcess):
@@ -286,259 +543,21 @@ class PolicyTrainerRayProcess(RayProcess):
 
     def from_pretrained(
         self,
-        args: grpo_utils.GRPOExperimentConfig,
-        model_config: ModelConfig,
-        beaker_config: BeakerRuntimeConfig,
-        wandb_url: str,
-        tokenizer: PreTrainedTokenizer,
-    ) -> dict[str, Any]:
-        # Keep heavyweight DeepSpeed/Transformers objects as local imports so
-        # Ray does not try to pickle module-level config state when exporting
-        # this actor method.
-        local_deepspeed = __import__("deepspeed")
-        local_ulysses_module = __import__(
-            "deepspeed.runtime.sequence_parallel.ulysses_sp",
-            fromlist=["UlyssesSPAttentionHF"],
+        args,
+        model_config,
+        beaker_config,
+        wandb_url,
+        tokenizer,
+    ):
+        # Keep this actor method tiny. Ray/cloudpickle serializes the method
+        # before execution; a string import avoids capturing module globals such
+        # as DeepSpeed config objects that are not picklable.
+        module = __import__(
+            "open_instruct.grpo_fast",
+            fromlist=["_policy_trainer_ray_process_from_pretrained_impl"],
         )
-        LocalUlyssesSPAttentionHF = getattr(local_ulysses_module, "UlyssesSPAttentionHF")
-        local_groups = __import__("deepspeed.utils", fromlist=["groups"]).groups
-        local_transformers = __import__("transformers", fromlist=["AutoModelForCausalLM", "get_scheduler"])
-        LocalAutoModelForCausalLM = getattr(local_transformers, "AutoModelForCausalLM")
-        local_get_scheduler = getattr(local_transformers, "get_scheduler")
-        local_transformers_integrations = __import__(
-            "transformers.integrations",
-            fromlist=["HfDeepSpeedConfig"],
-        )
-        LocalHfDeepSpeedConfig = getattr(local_transformers_integrations, "HfDeepSpeedConfig")
-        local_model_utils = __import__("open_instruct.model_utils", fromlist=[""])
-        local_utils = __import__("open_instruct.utils", fromlist=[""])
-        local_disable_dropout_in_model = getattr(local_model_utils, "disable_dropout_in_model")
-        local_load_ref_policy = getattr(local_model_utils, "load_ref_policy")
-        LocalUlyssesSPSplitter = getattr(local_utils, "UlyssesSPSplitter")
-        local_get_eval_ds_config = getattr(local_utils, "get_eval_ds_config")
-        local_get_optimizer_grouped_parameters = getattr(local_utils, "get_optimizer_grouped_parameters")
-        local_get_train_ds_config = getattr(local_utils, "get_train_ds_config")
-        local_logger = __import__("logging").getLogger(__name__)
-
-        # ------------------------------------------------------------
-        # Monkey patch to load checkpoints with `weights_only=False`
-        # otherwise it errors out with:
-        # `_pickle.UnpicklingError: Weights only load failed. ` with pytorch 2.6.0
-        torch_checkpoint_engine = __import__(
-            "deepspeed.runtime.checkpoint_engine",
-            fromlist=["torch_checkpoint_engine"],
-        ).torch_checkpoint_engine
-        local_ds_logger = __import__("deepspeed.utils", fromlist=["logger"]).logger
-
-        def load(self, path: str, map_location=None):
-            local_ds_logger.info(f"[Torch] Loading checkpoint from {path}...")
-            partition = torch.load(path, map_location=map_location, weights_only=False)
-            local_ds_logger.info(f"[Torch] Loaded checkpoint from {path}.")
-            return partition
-
-        torch_checkpoint_engine.TorchCheckpointEngine.load = load
-
-        # ------------------------------------------------------------
-        self.args = args
-        self.tokenizer = tokenizer
-        self.model_config = model_config
-        self.beaker_config = beaker_config
-        self.wandb_url = wandb_url
-        torch.cuda.set_device(self.local_rank)
-        self.device = torch.device(self.local_rank)
-
-        # Set seeds for this worker (different per rank to avoid correlation)
-        worker_seed = args.seed + self.local_rank
-        torch.manual_seed(worker_seed)
-        torch.cuda.manual_seed(worker_seed)
-        np.random.seed(worker_seed)
-        random.seed(worker_seed)
-
-        # Pre-initialize torch.distributed WITHOUT device_id to avoid NCCL hangs.
-        # DeepSpeed 0.17.3 and up sets device_id in init_process_group which can cause hangs
-        # when multiple process groups exist (e.g., for weight sync to vLLM).
-        # By initializing first, DeepSpeed will detect it and wrap it instead of re-initializing.
-        if not torch.distributed.is_initialized():
-            torch.distributed.init_process_group(backend="nccl", timeout=timedelta(minutes=args.backend_timeout))
-        local_deepspeed.init_distributed(timeout=timedelta(minutes=args.backend_timeout))
-
-        ds_config = local_get_train_ds_config(
-            offload=args.deepspeed_offload_param,
-            adam_offload=args.deepspeed_offload_optimizer,
-            stage=args.deepspeed_stage,
-            bf16=True,
-            max_norm=args.max_grad_norm if args.max_grad_norm is not None else 0.0,
-            zpg=args.deepspeed_zpg,
-            sequence_parallel_size=args.sequence_parallel_size,
-        )
-        ds_config["train_micro_batch_size_per_gpu"] = args.per_device_train_batch_size
-        ds_config["gradient_accumulation_steps"] = 1
-        ds_config["checkpoint"] = {"load_universal": args.deepspeed_checkpoint_load_universal}
-        # @vwxyzjn: MAGIC: it's actually needed to initialize this `dschf`, so
-        # https://huggingface.co/docs/transformers/deepspeed#non-trainer-deepspeed-integration
-        # next line instructs transformers to partition the model directly over multiple gpus using
-        # deepspeed.zero.Init when model's `from_pretrained` method is called.
-        if ds_config is not None and ds_config["zero_optimization"]["stage"] == 3:
-            dschf = LocalHfDeepSpeedConfig(ds_config)
-        else:
-            dschf = None
-        local_logger.info(f"Deepspeed config: {dschf=}")
-
-        self.policy = LocalAutoModelForCausalLM.from_pretrained(
-            model_config.model_name_or_path,
-            revision=model_config.model_revision,
-            dtype=torch.bfloat16,
-            attn_implementation=local_model_utils.olmo_core_attn_to_hf(model_config.attn_implementation),
-            **({"device_map": {"": self.local_rank}} if args.deepspeed_stage != 3 else {}),
-        )
-        self.mpu = LocalUlyssesSPAttentionHF.register_with_transformers(
-            model_name_or_path=self.policy,
-            core_attn_implementation=local_model_utils.olmo_core_attn_to_hf(model_config.attn_implementation),
-            sequence_parallel_size=args.sequence_parallel_size,
-            micro_batch_size=args.per_device_train_batch_size,
-            seq_length_is_variable=True,
-        )
-        self._model_name_or_path = model_config.model_name_or_path
-        self.policy.config.use_cache = False
-        local_disable_dropout_in_model(self.policy)
-        self.policy.gradient_checkpointing_enable()
-        if args.set_weight_decay_on_bias_and_norm:
-            optim_params = local_get_optimizer_grouped_parameters(self.policy, args.weight_decay)
-        else:
-            optim_params = self.policy.parameters()
-        self.optimizer = torch.optim.AdamW(optim_params, lr=args.learning_rate, fused=args.fused_optimizer)
-        num_scheduler_steps = args.num_training_steps * args.num_epochs * args.num_mini_batches
-        warmup_steps = int(num_scheduler_steps * args.warmup_ratio)
-        scheduler = local_get_scheduler(
-            args.lr_scheduler_type,
-            optimizer=self.optimizer,
-            num_warmup_steps=warmup_steps,
-            num_training_steps=num_scheduler_steps,
-        )
-        self.model, self.optimizer, _, self.scheduler = local_deepspeed.initialize(
-            model=self.policy,
-            optimizer=self.optimizer,
-            config=ds_config,
-            lr_scheduler=scheduler,
-            dist_init_required=False,
-            mpu=self.mpu,
-        )
-        optimization_steps_done = 0
-        checkpoint_state = None
-        if args.checkpoint_state_dir:
-            # check if the dir exists
-            if not os.path.exists(args.checkpoint_state_dir):
-                local_logger.warning(
-                    f"Skipping loading checkpoint state from {args.checkpoint_state_dir} because it does not exist!"
-                )
-            else:
-                # remove mpu for loading checkpoints, add it back after loading
-                old_mpu = self.mpu
-                self.model.mpu = None
-                path, states = self.model.load_checkpoint(
-                    args.checkpoint_state_dir,
-                    load_module_strict=True,
-                    load_optimizer_states=True,
-                    load_lr_scheduler_states=True,
-                    load_module_only=False,
-                )
-                self.model.mpu = old_mpu
-                if path is None:
-                    raise ValueError(f"Failed to load checkpoint from {args.checkpoint_state_dir}")
-                checkpoint_state = states
-                optimization_steps_done = states["training_step"]
-
-                rng_states = states["rng_states"]
-                torch.set_rng_state(rng_states["torch_cpu_rng_state"])
-                np.random.set_state(rng_states["numpy_rng_state"])
-                random.setstate(rng_states["python_rng_state"])
-
-                if torch.cuda.is_available() and "torch_cuda_rng_states" in rng_states:
-                    # device_str, e.g. "cuda:0"
-                    for device_str, rng_state in rng_states["torch_cuda_rng_states"].items():
-                        device_id = int(device_str.split(":")[1])
-                        torch.cuda.set_rng_state(rng_state, device_id)
-                    if "torch_cuda_rng_state_all" in rng_states:
-                        torch.cuda.set_rng_state_all(rng_states["torch_cuda_rng_state_all"])
-
-                local_logger.info(f"{self.rank=}: Restored RNG states from checkpoint")
-
-                # Save reference policy path to load later (after ref_policy is initialized)
-                self.ref_policy_checkpoint_path = None
-                if args.load_ref_policy and states.get("ref_policy_saved", False):
-                    ref_policy_dir = os.path.join(args.checkpoint_state_dir, "ref_policy")
-                    model_path = os.path.join(ref_policy_dir, "pytorch_model.bin")
-                    if os.path.exists(model_path):
-                        self.ref_policy_checkpoint_path = model_path
-                        local_logger.info(f"{self.rank=}: Will load reference policy from {model_path}")
-
-                local_logger.info(
-                    f"{self.rank=}: Loaded checkpoint from {args.checkpoint_state_dir} with {optimization_steps_done=}"
-                )
-        self.model.train()
-
-        # reference model
-        if args.load_ref_policy:
-            ds_config, self.ref_policy_hf_ds_config = local_get_eval_ds_config(
-                offload=False,
-                # inference model only has stage 3 (sharding) or stage 0 (no sharding)
-                # stage 2 is optimizer sharding which doesn't apply to inference
-                stage=args.deepspeed_stage if args.deepspeed_stage == 3 else 0,
-                bf16=True,
-                per_device_train_batch_size=args.per_device_train_batch_size,
-            )
-
-            self.ref_policy = local_load_ref_policy(
-                model_config=model_config,
-                ds_config=ds_config,
-                deepspeed_stage=args.deepspeed_stage,
-                local_rank=self.local_rank,
-                device=self.device,
-                rank=self.rank,
-                checkpoint_path=self.ref_policy_checkpoint_path
-                if hasattr(self, "ref_policy_checkpoint_path")
-                else None,
-                mpu=self.mpu,
-                ref_policy_update_freq=args.ref_policy_update_freq,
-                alpha=args.alpha,
-            )
-        self.local_metrics = local_utils.MetricsTracker(max_metrics=512, device=self.device)
-
-        if self.mpu is not None:
-            self.splitter = LocalUlyssesSPSplitter(
-                sp_rank=local_groups._get_sequence_parallel_rank(),
-                sp_group=local_groups._get_sequence_parallel_group(),
-                sp_world_size=local_groups._get_sequence_parallel_world_size(),
-                device=self.device,
-                pad_token_id=self.tokenizer.pad_token_id,
-            )
-        else:
-            self.splitter = None
-
-        # dp_rank = which data-parallel group this worker belongs to
-        # With SP, workers in the same SP group share the same dp_rank
-        dp_rank = self.rank // args.sequence_parallel_size
-        assert dp_rank < self.dp_world_size
-
-        # Verify SP groups are consecutive as we assume for above logic (e.g., [0,1,2,3], [4,5,6,7], ...)
-        # getting the dp_rank directly does not work right now with the mpus :/
-        if self.mpu is not None:
-            sp_group = local_groups._get_sequence_parallel_group()
-            sp_ranks = sorted(torch.distributed.get_process_group_ranks(sp_group))
-            expected = list(range(dp_rank * args.sequence_parallel_size, (dp_rank + 1) * args.sequence_parallel_size))
-            assert sp_ranks == expected, f"SP group {sp_ranks} != expected {expected}"
-
-        self._streaming_dataloader = self.streaming_config.build_dataloader(
-            tokenizer=tokenizer,
-            dp_rank=dp_rank,
-            fs_local_rank=self.local_rank,
-            num_training_steps=args.num_training_steps,
-            work_dir=args.output_dir,
-            dp_world_size=self.dp_world_size,
-        )
-        self.dataloader = iter(self._streaming_dataloader)
-
-        return {"optimization_steps_done": optimization_steps_done, "checkpoint_state": checkpoint_state}
+        impl = getattr(module, "_policy_trainer_ray_process_from_pretrained_impl")
+        return impl(self, args, model_config, beaker_config, wandb_url, tokenizer)
 
     def setup_model_update_group(self, vllm_engines):
         self.vllm_engines = vllm_engines
