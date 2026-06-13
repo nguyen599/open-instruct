@@ -318,6 +318,7 @@ class PolicyTrainerRayProcess(RayProcess):
         local_get_eval_ds_config = getattr(local_utils, "get_eval_ds_config")
         local_get_optimizer_grouped_parameters = getattr(local_utils, "get_optimizer_grouped_parameters")
         local_get_train_ds_config = getattr(local_utils, "get_train_ds_config")
+        local_logger = __import__("logging").getLogger(__name__)
 
         # ------------------------------------------------------------
         # Monkey patch to load checkpoints with `weights_only=False`
@@ -381,7 +382,7 @@ class PolicyTrainerRayProcess(RayProcess):
             dschf = LocalHfDeepSpeedConfig(ds_config)
         else:
             dschf = None
-        logger.info(f"Deepspeed config: {dschf=}")
+        local_logger.info(f"Deepspeed config: {dschf=}")
 
         self.policy = LocalAutoModelForCausalLM.from_pretrained(
             model_config.model_name_or_path,
@@ -427,7 +428,7 @@ class PolicyTrainerRayProcess(RayProcess):
         if args.checkpoint_state_dir:
             # check if the dir exists
             if not os.path.exists(args.checkpoint_state_dir):
-                logger.warning(
+                local_logger.warning(
                     f"Skipping loading checkpoint state from {args.checkpoint_state_dir} because it does not exist!"
                 )
             else:
@@ -460,7 +461,7 @@ class PolicyTrainerRayProcess(RayProcess):
                     if "torch_cuda_rng_state_all" in rng_states:
                         torch.cuda.set_rng_state_all(rng_states["torch_cuda_rng_state_all"])
 
-                logger.info(f"{self.rank=}: Restored RNG states from checkpoint")
+                local_logger.info(f"{self.rank=}: Restored RNG states from checkpoint")
 
                 # Save reference policy path to load later (after ref_policy is initialized)
                 self.ref_policy_checkpoint_path = None
@@ -469,9 +470,9 @@ class PolicyTrainerRayProcess(RayProcess):
                     model_path = os.path.join(ref_policy_dir, "pytorch_model.bin")
                     if os.path.exists(model_path):
                         self.ref_policy_checkpoint_path = model_path
-                        logger.info(f"{self.rank=}: Will load reference policy from {model_path}")
+                        local_logger.info(f"{self.rank=}: Will load reference policy from {model_path}")
 
-                logger.info(
+                local_logger.info(
                     f"{self.rank=}: Loaded checkpoint from {args.checkpoint_state_dir} with {optimization_steps_done=}"
                 )
         self.model.train()
