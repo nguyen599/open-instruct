@@ -559,8 +559,14 @@ async def update_llm_engine_weights_async(llm_engine: Any, update_info: WeightUp
         return
 
     # vLLM >=0.21 requires an explicit start/update/finish handshake for
-    # streamed trainer weights. Older vLLM versions only expose update_weights.
-    await start_weight_update(is_checkpoint_format=False)
+    # streamed trainer weights. Open-Instruct sends HF/checkpoint-format tensors
+    # from the learner, not already-sharded vLLM kernel-format tensors, so keep
+    # checkpoint-format loading enabled by default. Set
+    # OPEN_INSTRUCT_VLLM_WEIGHT_SYNC_CHECKPOINT_FORMAT=0 to restore the old
+    # direct-copy path for explicit experiments.
+    checkpoint_format = os.environ.get("OPEN_INSTRUCT_VLLM_WEIGHT_SYNC_CHECKPOINT_FORMAT", "1").strip().lower()
+    is_checkpoint_format = checkpoint_format not in {"0", "false", "no", "off"}
+    await start_weight_update(is_checkpoint_format=is_checkpoint_format)
     try:
         await llm_engine.update_weights(request)
     finally:
