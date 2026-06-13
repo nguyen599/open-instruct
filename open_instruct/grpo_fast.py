@@ -292,6 +292,24 @@ class PolicyTrainerRayProcess(RayProcess):
         wandb_url: str,
         tokenizer: PreTrainedTokenizer,
     ) -> dict[str, Any]:
+        # Keep heavyweight DeepSpeed/Transformers objects as local imports so
+        # Ray does not try to pickle module-level config state when exporting
+        # this actor method.
+        import deepspeed as local_deepspeed  # noqa: PLC0415
+        from deepspeed.runtime.sequence_parallel.ulysses_sp import UlyssesSPAttentionHF as LocalUlyssesSPAttentionHF  # noqa: PLC0415
+        from deepspeed.utils import groups as local_groups  # noqa: PLC0415
+        from transformers import AutoModelForCausalLM as LocalAutoModelForCausalLM  # noqa: PLC0415
+        from transformers import get_scheduler as local_get_scheduler  # noqa: PLC0415
+        from transformers.integrations import HfDeepSpeedConfig as LocalHfDeepSpeedConfig  # noqa: PLC0415
+        from open_instruct import model_utils as local_model_utils  # noqa: PLC0415
+        from open_instruct import utils as local_utils  # noqa: PLC0415
+        from open_instruct.model_utils import disable_dropout_in_model as local_disable_dropout_in_model  # noqa: PLC0415
+        from open_instruct.model_utils import load_ref_policy as local_load_ref_policy  # noqa: PLC0415
+        from open_instruct.utils import UlyssesSPSplitter as LocalUlyssesSPSplitter  # noqa: PLC0415
+        from open_instruct.utils import get_eval_ds_config as local_get_eval_ds_config  # noqa: PLC0415
+        from open_instruct.utils import get_optimizer_grouped_parameters as local_get_optimizer_grouped_parameters  # noqa: PLC0415
+        from open_instruct.utils import get_train_ds_config as local_get_train_ds_config  # noqa: PLC0415
+
         # ------------------------------------------------------------
         # Monkey patch to load checkpoints with `weights_only=False`
         # otherwise it errors out with:
@@ -329,9 +347,9 @@ class PolicyTrainerRayProcess(RayProcess):
         # By initializing first, DeepSpeed will detect it and wrap it instead of re-initializing.
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group(backend="nccl", timeout=timedelta(minutes=args.backend_timeout))
-        deepspeed.init_distributed(timeout=timedelta(minutes=args.backend_timeout))
+        local_deepspeed.init_distributed(timeout=timedelta(minutes=args.backend_timeout))
 
-        ds_config = get_train_ds_config(
+        ds_config = local_get_train_ds_config(
             offload=args.deepspeed_offload_param,
             adam_offload=args.deepspeed_offload_optimizer,
             stage=args.deepspeed_stage,
@@ -348,43 +366,43 @@ class PolicyTrainerRayProcess(RayProcess):
         # next line instructs transformers to partition the model directly over multiple gpus using
         # deepspeed.zero.Init when model's `from_pretrained` method is called.
         if ds_config is not None and ds_config["zero_optimization"]["stage"] == 3:
-            dschf = HfDeepSpeedConfig(ds_config)
+            dschf = LocalHfDeepSpeedConfig(ds_config)
         else:
             dschf = None
         logger.info(f"Deepspeed config: {dschf=}")
 
-        self.policy: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
+        self.policy: PreTrainedModel = LocalAutoModelForCausalLM.from_pretrained(
             model_config.model_name_or_path,
             revision=model_config.model_revision,
             dtype=torch.bfloat16,
-            attn_implementation=model_utils.olmo_core_attn_to_hf(model_config.attn_implementation),
+            attn_implementation=local_model_utils.olmo_core_attn_to_hf(model_config.attn_implementation),
             **({"device_map": {"": self.local_rank}} if args.deepspeed_stage != 3 else {}),
         )
-        self.mpu = UlyssesSPAttentionHF.register_with_transformers(
+        self.mpu = LocalUlyssesSPAttentionHF.register_with_transformers(
             model_name_or_path=self.policy,
-            core_attn_implementation=model_utils.olmo_core_attn_to_hf(model_config.attn_implementation),
+            core_attn_implementation=local_model_utils.olmo_core_attn_to_hf(model_config.attn_implementation),
             sequence_parallel_size=args.sequence_parallel_size,
             micro_batch_size=args.per_device_train_batch_size,
             seq_length_is_variable=True,
         )
         self._model_name_or_path = model_config.model_name_or_path
         self.policy.config.use_cache = False
-        disable_dropout_in_model(self.policy)
+        local_disable_dropout_in_model(self.policy)
         self.policy.gradient_checkpointing_enable()
         if args.set_weight_decay_on_bias_and_norm:
-            optim_params = get_optimizer_grouped_parameters(self.policy, args.weight_decay)
+            optim_params = local_get_optimizer_grouped_parameters(self.policy, args.weight_decay)
         else:
             optim_params = self.policy.parameters()
         self.optimizer = torch.optim.AdamW(optim_params, lr=args.learning_rate, fused=args.fused_optimizer)
         num_scheduler_steps = args.num_training_steps * args.num_epochs * args.num_mini_batches
         warmup_steps = int(num_scheduler_steps * args.warmup_ratio)
-        scheduler = get_scheduler(
+        scheduler = local_get_scheduler(
             args.lr_scheduler_type,
             optimizer=self.optimizer,
             num_warmup_steps=warmup_steps,
             num_training_steps=num_scheduler_steps,
         )
-        self.model, self.optimizer, _, self.scheduler = deepspeed.initialize(
+        self.model, self.optimizer, _, self.scheduler = local_deepspeed.initialize(
             model=self.policy,
             optimizer=self.optimizer,
             config=ds_config,
@@ -448,7 +466,7 @@ class PolicyTrainerRayProcess(RayProcess):
 
         # reference model
         if args.load_ref_policy:
-            ds_config, self.ref_policy_hf_ds_config = get_eval_ds_config(
+            ds_config, self.ref_policy_hf_ds_config = local_get_eval_ds_config(
                 offload=False,
                 # inference model only has stage 3 (sharding) or stage 0 (no sharding)
                 # stage 2 is optimizer sharding which doesn't apply to inference
@@ -457,7 +475,7 @@ class PolicyTrainerRayProcess(RayProcess):
                 per_device_train_batch_size=args.per_device_train_batch_size,
             )
 
-            self.ref_policy: PreTrainedModel = load_ref_policy(
+            self.ref_policy: PreTrainedModel = local_load_ref_policy(
                 model_config=model_config,
                 ds_config=ds_config,
                 deepspeed_stage=args.deepspeed_stage,
@@ -471,13 +489,13 @@ class PolicyTrainerRayProcess(RayProcess):
                 ref_policy_update_freq=args.ref_policy_update_freq,
                 alpha=args.alpha,
             )
-        self.local_metrics = utils.MetricsTracker(max_metrics=512, device=self.device)
+        self.local_metrics = local_utils.MetricsTracker(max_metrics=512, device=self.device)
 
         if self.mpu is not None:
-            self.splitter = UlyssesSPSplitter(
-                sp_rank=groups._get_sequence_parallel_rank(),
-                sp_group=groups._get_sequence_parallel_group(),
-                sp_world_size=groups._get_sequence_parallel_world_size(),
+            self.splitter = LocalUlyssesSPSplitter(
+                sp_rank=local_groups._get_sequence_parallel_rank(),
+                sp_group=local_groups._get_sequence_parallel_group(),
+                sp_world_size=local_groups._get_sequence_parallel_world_size(),
                 device=self.device,
                 pad_token_id=self.tokenizer.pad_token_id,
             )
@@ -492,7 +510,7 @@ class PolicyTrainerRayProcess(RayProcess):
         # Verify SP groups are consecutive as we assume for above logic (e.g., [0,1,2,3], [4,5,6,7], ...)
         # getting the dp_rank directly does not work right now with the mpus :/
         if self.mpu is not None:
-            sp_group = groups._get_sequence_parallel_group()
+            sp_group = local_groups._get_sequence_parallel_group()
             sp_ranks = sorted(torch.distributed.get_process_group_ranks(sp_group))
             expected = list(range(dp_rank * args.sequence_parallel_size, (dp_rank + 1) * args.sequence_parallel_size))
             assert sp_ranks == expected, f"SP group {sp_ranks} != expected {expected}"
