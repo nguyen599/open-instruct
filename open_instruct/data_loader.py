@@ -488,6 +488,7 @@ class StreamingDataLoaderConfig:
     deepseekmath_v2_max_context_length: int = 102400
     deepseekmath_v2_temperature: float = 0.0
     deepseekmath_v2_timeout: int = 60
+    deepseekmath_v2_extra_body_json: str | None = None
     deepseekmath_v2_proof_weight: float = 0.76
     deepseekmath_v2_self_eval_weight: float = 0.24
     deepseekmath_v2_enable_meta_verification: bool = True

@@ -1076,6 +1076,7 @@ class DeepSeekMathV2VerifierConfig(VerifierConfig):
     deepseekmath_v2_max_context_length: int = 102400
     deepseekmath_v2_temperature: float = 0.0
     deepseekmath_v2_timeout: int = 60
+    deepseekmath_v2_extra_body_json: str | None = None
     deepseekmath_v2_proof_weight: float = 0.76
     deepseekmath_v2_self_eval_weight: float = 0.24
     deepseekmath_v2_enable_meta_verification: bool = True
@@ -1109,6 +1110,20 @@ class DeepSeekMathV2VerifierConfig(VerifierConfig):
                 "--deepseekmath_v2_api_key."
             )
         return api_key
+
+    def extra_body(self, model: str) -> dict[str, Any] | None:
+        if self.deepseekmath_v2_extra_body_json:
+            parsed = json.loads(self.deepseekmath_v2_extra_body_json)
+            if not isinstance(parsed, dict):
+                raise ValueError("--deepseekmath_v2_extra_body_json must parse to a JSON object.")
+            return parsed
+        base_url = self.resolved_base_url() or ""
+        if "openrouter.ai" in base_url and model.startswith("deepseek/"):
+            return {
+                "reasoning": {"enabled": True},
+                "provider": {"only": ["deepseek"], "allow_fallbacks": False},
+            }
+        return None
 
 
 @dataclasses.dataclass
@@ -1236,7 +1251,27 @@ class DeepSeekMathV2Verifier(VerifierFunction):
 
     @staticmethod
     def _resolve_problem(label: Any, query: str | None) -> str:
+        def problem_from_label(value: Any) -> str:
+            if isinstance(value, str):
+                try:
+                    value = json.loads(value)
+                except json.JSONDecodeError:
+                    return ""
+            if isinstance(value, dict):
+                for key in ("query", "question", "problem", "Question", "Problem"):
+                    label_value = value.get(key)
+                    if label_value:
+                        return str(label_value)
+            return ""
+
+        label_problem = problem_from_label(label)
+        if label_problem:
+            return label_problem
+
         if query:
+            problem_match = re.search(r"(?ims)^##[ \t]+Problem[ \t]*\n(?P<problem>.*)$", query)
+            if problem_match is not None:
+                return problem_match.group("problem").strip()
             return query
         if isinstance(label, str):
             try:
@@ -1284,13 +1319,17 @@ class DeepSeekMathV2Verifier(VerifierFunction):
             self.config.resolved_api_key(),
             self.config.deepseekmath_v2_timeout,
         )
-        response = await client.chat.completions.create(
-            model=model,
-            messages=messages,
-            temperature=self.config.deepseekmath_v2_temperature,
-            max_completion_tokens=self.config.deepseekmath_v2_max_tokens,
-            timeout=self.config.deepseekmath_v2_timeout,
-        )
+        request_kwargs: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "temperature": self.config.deepseekmath_v2_temperature,
+            "max_completion_tokens": self.config.deepseekmath_v2_max_tokens,
+            "timeout": self.config.deepseekmath_v2_timeout,
+        }
+        extra_body = self.config.extra_body(model)
+        if extra_body is not None:
+            request_kwargs["extra_body"] = extra_body
+        response = await client.chat.completions.create(**request_kwargs)
         content = response.choices[0].message.content or ""
         return content, self._response_cost(response, model)
 
