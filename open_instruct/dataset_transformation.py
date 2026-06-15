@@ -76,6 +76,10 @@ TRUE_ENV_VALUES = {"1", "true", "yes", "y", "on"}
 FALSE_ENV_VALUES = {"0", "false", "no", "n", "off"}
 QWEN_USE_ENVIRONMENT_ROLE_ENVS = ("OLMO_QWEN_USE_ENVIRONMENT_ROLE", "OPEN_INSTRUCT_QWEN_USE_ENVIRONMENT_ROLE")
 QWEN_FAST_CHAR_MASK_ENV = "OPEN_INSTRUCT_QWEN_FAST_CHAR_MASK"
+QWEN_NO_TOOLS_SYSTEM_MESSAGE = {
+    "role": "system",
+    "content": "You are helpful assistant\nYou do not currently have access to any functions.",
+}
 
 
 def env_flag_enabled(name: str) -> bool:
@@ -1091,9 +1095,9 @@ TOOLS_COLUMN_KEY = "tools"
 ENV_CONFIG_KEY = "env_config"
 EMPTY_DATASET_STATISTICS = {"per_dataset_stats": [], "dataset_order": []}
 
-# Cache version: increment this when transformation logic changes significantly
-# to invalidate old caches. v9: Batched Qwen tokenization and source-column fast path.
-DATASET_CACHE_VERSION = "v9"
+# Cache version: increment this when transformation logic changes significantly.
+# v10: Add the no-tools Qwen system message before tokenization.
+DATASET_CACHE_VERSION = "v10"
 
 
 def _normalize_env_config_column(row: dict[str, Any]) -> None:
@@ -1465,6 +1469,17 @@ def normalize_qwen_messages(messages: Any, sft_messages_key: str = DEFAULT_SFT_M
     return normalized
 
 
+def prepare_qwen_messages_for_template(
+    messages: Any,
+    tools: list[dict[str, Any]] | None,
+    sft_messages_key: str = DEFAULT_SFT_MESSAGES_KEY,
+) -> list[dict[str, Any]]:
+    normalized = normalize_qwen_messages(messages, sft_messages_key)
+    if tools is None and not any(message["role"] == "system" for message in normalized):
+        return [dict(QWEN_NO_TOOLS_SYSTEM_MESSAGE), *normalized]
+    return normalized
+
+
 def _qwen_chat_template_kwargs(
     messages: list[dict[str, Any]],
     max_seq_length: int,
@@ -1548,8 +1563,12 @@ def sft_qwen_messages_tokenize_and_truncate_fast_v1(
     sft_messages_key: str = DEFAULT_SFT_MESSAGES_KEY,
     tool_schema_key: str = TOOL_SCHEMA_COLUMN_KEY,
 ):
-    messages = normalize_qwen_messages(row[sft_messages_key], sft_messages_key)
     tools = normalize_optional_tool_schema(row.get(tool_schema_key), tool_schema_key)
+    messages = prepare_qwen_messages_for_template(
+        row[sft_messages_key],
+        tools,
+        sft_messages_key,
+    )
     rendered = tokenizer.apply_chat_template(
         **_qwen_chat_template_kwargs(
             messages,
@@ -1593,8 +1612,12 @@ def sft_qwen_messages_tokenize_and_truncate_v1(
             tool_schema_key=tool_schema_key,
         )
 
-    messages = normalize_qwen_messages(row[sft_messages_key], sft_messages_key)
     tools = normalize_optional_tool_schema(row.get(tool_schema_key), tool_schema_key)
+    messages = prepare_qwen_messages_for_template(
+        row[sft_messages_key],
+        tools,
+        sft_messages_key,
+    )
     input_ids_result = tokenizer.apply_chat_template(
         **_qwen_chat_template_kwargs(
             messages,

@@ -139,6 +139,35 @@ class TestQwenToolCallNormalization(unittest.TestCase):
             {"code": "math.gcd(65, 102)"},
         )
 
+    def test_no_tools_adds_default_system_message(self):
+        messages = [
+            {"role": "user", "content": "Prove the claim."},
+            {"role": "assistant", "content": "Proof."},
+        ]
+
+        normalized = open_instruct.dataset_transformation.prepare_qwen_messages_for_template(messages, None)
+
+        self.assertEqual(normalized[0], open_instruct.dataset_transformation.QWEN_NO_TOOLS_SYSTEM_MESSAGE)
+        self.assertEqual(normalized[1:], messages)
+
+    def test_tools_do_not_add_default_system_message(self):
+        messages = [{"role": "user", "content": "Compute the value."}]
+        tools = [{"type": "function", "function": {"name": "python"}}]
+
+        normalized = open_instruct.dataset_transformation.prepare_qwen_messages_for_template(messages, tools)
+
+        self.assertEqual(normalized, messages)
+
+    def test_existing_system_message_is_preserved_without_tools(self):
+        messages = [
+            {"role": "system", "content": "Use concise proofs."},
+            {"role": "user", "content": "Prove the claim."},
+        ]
+
+        normalized = open_instruct.dataset_transformation.prepare_qwen_messages_for_template(messages, None)
+
+        self.assertEqual(normalized, messages)
+
 
 class TestCachedDataset(unittest.TestCase):
     def setUp(self):
