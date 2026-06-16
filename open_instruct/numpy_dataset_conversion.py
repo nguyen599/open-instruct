@@ -34,6 +34,7 @@ TOKEN_IDS_METADATA_GLOB = "token_ids_part_*.csv.gz"
 POLARS_SUPPORTED_TOKENIZE_FNS = {
     "sft_qwen_messages_tokenize_and_truncate_v1",
     "sft_qwen_messages_tokenize_and_truncate_batched_v1",
+    "sft_tulu_tokenize_and_truncate_v1",
 }
 
 
@@ -277,10 +278,16 @@ def _polars_backend_supported(
         if not os.path.exists(dataset_name) or not dataset_name.endswith(".parquet"):
             return False, "polars backend supports only local parquet mixer entries"
     if len(dataset_transform_fn) != 2:
-        return False, "polars backend supports only Qwen tokenize + sft_tulu_filter_v1 transforms"
+        return False, "polars backend supports only messages SFT tokenize + sft_tulu_filter_v1 transforms"
     if dataset_transform_fn[0] not in POLARS_SUPPORTED_TOKENIZE_FNS or dataset_transform_fn[1] != "sft_tulu_filter_v1":
-        return False, "polars backend supports only Qwen tokenize + sft_tulu_filter_v1 transforms"
-    return True, "supported local parquet Qwen SFT conversion"
+        return False, "polars backend supports only messages SFT tokenize + sft_tulu_filter_v1 transforms"
+    return True, "supported local parquet messages SFT conversion"
+
+
+def _polars_row_tokenize_fn(fn_name: str):
+    if fn_name == "sft_qwen_messages_tokenize_and_truncate_batched_v1":
+        fn_name = "sft_qwen_messages_tokenize_and_truncate_v1"
+    return getattr(dataset_transformation, fn_name)
 
 
 def _normalize_polars_value(value: Any, field_name: str) -> Any:
@@ -391,7 +398,8 @@ def _convert_local_parquet_to_numpy_sft_polars(
 
     if visualize:
         logger.info("Visualizing first example with polars backend...")
-        preview = dataset_transformation.sft_qwen_messages_tokenize_and_truncate_v1(
+        tokenize_fn = _polars_row_tokenize_fn(dataset_transform_fn[0])
+        preview = tokenize_fn(
             row=dict(rows[0]),
             tokenizer=tc.tokenizer,
             max_seq_length=max_seq_length,
@@ -454,6 +462,8 @@ def _convert_local_parquet_to_numpy_sft_polars(
         tokenize_window_size,
         batch_size,
     )
+    tokenize_fn = _polars_row_tokenize_fn(dataset_transform_fn[0])
+    logger.info("Polars tokenize function: %s", dataset_transform_fn[0])
 
     def tokenize_polars_row(row: dict[str, Any]) -> tuple[dict[str, Any], list[int], np.ndarray, list[int]]:
         tokenized_row = {
@@ -463,7 +473,7 @@ def _convert_local_parquet_to_numpy_sft_polars(
             tokenized_row[dataset_transformation.TOOL_SCHEMA_COLUMN_KEY] = row.get(
                 dataset_transformation.TOOL_SCHEMA_COLUMN_KEY
             )
-        tokenized = dataset_transformation.sft_qwen_messages_tokenize_and_truncate_v1(
+        tokenized = tokenize_fn(
             row=tokenized_row,
             tokenizer=tc.tokenizer,
             max_seq_length=max_length,
