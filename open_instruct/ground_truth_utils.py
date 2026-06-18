@@ -1319,9 +1319,14 @@ class DeepSeekMathV2Verifier(VerifierFunction):
         messages: list[dict[str, str]],
         model: str,
         stage: str,
+        *,
+        max_context_length_override: int | None = None,
     ) -> tuple[list[dict[str, str]], int]:
         prompt_tokens, tokenizer_name = self._estimate_messages_tokens(messages, model)
-        context_length = self.config.deepseekmath_v2_max_context_length
+        configured_context_length = self.config.deepseekmath_v2_max_context_length
+        context_length = configured_context_length
+        if max_context_length_override is not None:
+            context_length = min(configured_context_length, max(1, max_context_length_override))
         margin = max(0, self.config.deepseekmath_v2_context_margin_tokens)
         configured_max_tokens = max(1, self.config.deepseekmath_v2_max_tokens)
         effective_max_tokens = min(configured_max_tokens, max(1, context_length - prompt_tokens - margin))
@@ -1341,8 +1346,8 @@ class DeepSeekMathV2Verifier(VerifierFunction):
 
         logger.info(
             "DeepSeekMath-V2 judge budget stage=%s model=%s prompt_tokens=%d tokenizer=%s "
-            "configured_max_tokens=%d effective_max_tokens=%d context_length=%d margin=%d "
-            "prompt_chars=%d truncated=%s",
+            "configured_max_tokens=%d effective_max_tokens=%d context_length=%d "
+            "configured_context_length=%d local_context_length=%s margin=%d prompt_chars=%d truncated=%s",
             stage,
             model,
             prompt_tokens,
@@ -1350,6 +1355,8 @@ class DeepSeekMathV2Verifier(VerifierFunction):
             configured_max_tokens,
             effective_max_tokens,
             context_length,
+            configured_context_length,
+            max_context_length_override,
             margin,
             sum(len(message.get("content", "") or "") for message in messages),
             truncated,
@@ -1374,7 +1381,17 @@ class DeepSeekMathV2Verifier(VerifierFunction):
             model = getattr(local_judge, "model_name", None) or model
 
         messages = build_messages(prompt)
-        messages, max_completion_tokens = self._effective_judge_max_tokens(messages, model, stage)
+        local_context_length = None
+        if local_judge is not None:
+            llm_engine = getattr(local_judge, "llm_engine", None)
+            model_config = getattr(llm_engine, "model_config", None)
+            local_context_length = getattr(model_config, "max_model_len", None)
+        messages, max_completion_tokens = self._effective_judge_max_tokens(
+            messages,
+            model,
+            stage,
+            max_context_length_override=local_context_length,
+        )
         start_time = time.monotonic()
         if self.config.deepseekmath_v2_judge_backend == "local_vllm":
             client = getattr(local_judge, "client", None)
