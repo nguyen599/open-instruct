@@ -1076,6 +1076,7 @@ class DeepSeekMathV2VerifierConfig(VerifierConfig):
     deepseekmath_v2_max_tokens: int = 92160
     deepseekmath_v2_max_context_length: int = 102400
     deepseekmath_v2_context_margin_tokens: int = 256
+    deepseekmath_v2_min_completion_tokens: int = 2048
     deepseekmath_v2_temperature: float = 0.7
     deepseekmath_v2_top_p: float = 0.95
     deepseekmath_v2_timeout: int = 60
@@ -1329,13 +1330,18 @@ class DeepSeekMathV2Verifier(VerifierFunction):
             context_length = min(configured_context_length, max(1, max_context_length_override))
         margin = max(0, self.config.deepseekmath_v2_context_margin_tokens)
         configured_max_tokens = max(1, self.config.deepseekmath_v2_max_tokens)
+        reserved_completion_tokens = min(
+            configured_max_tokens,
+            max(1, self.config.deepseekmath_v2_min_completion_tokens),
+            max(1, context_length - margin - 1),
+        )
         effective_max_tokens = min(configured_max_tokens, max(1, context_length - prompt_tokens - margin))
         truncated = False
 
-        if prompt_tokens + margin + effective_max_tokens > context_length:
+        if prompt_tokens + margin + reserved_completion_tokens > context_length:
             messages = context_window_checker.truncate_messages_to_fit_context(
                 messages=messages,
-                max_completion_tokens=effective_max_tokens,
+                max_completion_tokens=reserved_completion_tokens,
                 model_name=model,
                 max_context_length=context_length,
                 safety_margin=margin,
@@ -1346,13 +1352,14 @@ class DeepSeekMathV2Verifier(VerifierFunction):
 
         logger.info(
             "DeepSeekMath-V2 judge budget stage=%s model=%s prompt_tokens=%d tokenizer=%s "
-            "configured_max_tokens=%d effective_max_tokens=%d context_length=%d "
+            "configured_max_tokens=%d reserved_completion_tokens=%d effective_max_tokens=%d context_length=%d "
             "configured_context_length=%d local_context_length=%s margin=%d prompt_chars=%d truncated=%s",
             stage,
             model,
             prompt_tokens,
             tokenizer_name,
             configured_max_tokens,
+            reserved_completion_tokens,
             effective_max_tokens,
             context_length,
             configured_context_length,

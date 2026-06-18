@@ -488,6 +488,7 @@ class StreamingDataLoaderConfig:
     deepseekmath_v2_max_tokens: int = 92160
     deepseekmath_v2_max_context_length: int = 102400
     deepseekmath_v2_context_margin_tokens: int = 256
+    deepseekmath_v2_min_completion_tokens: int = 2048
     deepseekmath_v2_temperature: float = 0.7
     deepseekmath_v2_top_p: float = 0.95
     deepseekmath_v2_timeout: int = 60
