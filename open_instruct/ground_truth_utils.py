@@ -990,7 +990,6 @@ Additionally, referencing anything from any paper does not save the need to prov
 ```
 
 Next, I will introduce the rules for you to analyze the quality of the "solution evaluation":
-
 1. Your task is to analyze the "solution evaluation". You do not need to solve the "problem", nor do you need to strictly assess whether the "solution" is accurate. Your only task is to strictly follow the rules below to evaluate whether the "solution evaluation" is reasonable.
 
 2. You need to analyze the content of the "solution evaluation" from three aspects:
@@ -1006,8 +1005,8 @@ Score Analysis: Whether the final score given by the "solution evaluation" match
 3. The most important part is **defect analysis**: In this part, your core task is to check whether the errors or defects of the "solution" pointed out in the "solution evaluation" are reasonable. In other words, any positive components about the "solution" in the "solution evaluation", regardless of whether they are reasonable, are not within your evaluation scope.
 
 - For example: If the "solution evaluation" says that a certain conclusion in the "solution" is correct, but actually this conclusion is incorrect, then you do not need to care about this point. All parts that the "solution evaluation" considers correct do not belong to your evaluation scope.
-- Specifically: If the "solution evaluation" believes that the "solution" is completely accurate and has not found any errors or defects, then regardless of whether the "solution" itself is actually accurate, even if there are obvious errors, you should still consider its analysis of errors to be reasonable.
 
+- Specifically: If the "solution evaluation" believes that the "solution" is completely accurate and has not found any errors or defects, then regardless of whether the "solution" itself is actually accurate, even if there are obvious errors, you should still consider its analysis of errors to be reasonable.
 **Importantly**, for defects found by the "solution evaluation", you need to analyze two points simultaneously:
 
 - whether this defect actually exists
