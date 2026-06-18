@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import string
+import time
 import weakref
 from abc import ABC, abstractmethod
 from collections import Counter, defaultdict
@@ -1374,6 +1375,7 @@ class DeepSeekMathV2Verifier(VerifierFunction):
 
         messages = build_messages(prompt)
         messages, max_completion_tokens = self._effective_judge_max_tokens(messages, model, stage)
+        start_time = time.monotonic()
         if self.config.deepseekmath_v2_judge_backend == "local_vllm":
             client = getattr(local_judge, "client", None)
             if client is None:
@@ -1387,7 +1389,19 @@ class DeepSeekMathV2Verifier(VerifierFunction):
                 "timeout": self.config.deepseekmath_v2_timeout,
             }
             response = await client.chat.completions.create(**request_kwargs)
-            content = response.choices[0].message.content or ""
+            choice = response.choices[0]
+            content = choice.message.content or ""
+            usage = getattr(response, "usage", None)
+            logger.info(
+                "DeepSeekMath-V2 judge response stage=%s backend=local_vllm seconds=%.2f "
+                "finish_reason=%s response_chars=%d usage_prompt_tokens=%s usage_completion_tokens=%s",
+                stage,
+                time.monotonic() - start_time,
+                getattr(choice, "finish_reason", None),
+                len(content),
+                getattr(usage, "prompt_tokens", None),
+                getattr(usage, "completion_tokens", None),
+            )
             return content, 0.0
 
         client = LMJudgeVerifier._client_for_values(
@@ -1407,7 +1421,19 @@ class DeepSeekMathV2Verifier(VerifierFunction):
         if extra_body is not None:
             request_kwargs["extra_body"] = extra_body
         response = await client.chat.completions.create(**request_kwargs)
-        content = response.choices[0].message.content or ""
+        choice = response.choices[0]
+        content = choice.message.content or ""
+        usage = getattr(response, "usage", None)
+        logger.info(
+            "DeepSeekMath-V2 judge response stage=%s backend=api seconds=%.2f "
+            "finish_reason=%s response_chars=%d usage_prompt_tokens=%s usage_completion_tokens=%s",
+            stage,
+            time.monotonic() - start_time,
+            getattr(choice, "finish_reason", None),
+            len(content),
+            getattr(usage, "prompt_tokens", None),
+            getattr(usage, "completion_tokens", None),
+        )
         return content, self._response_cost(response, model)
 
     async def async_call(

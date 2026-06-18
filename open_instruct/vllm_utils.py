@@ -540,6 +540,22 @@ async def compute_rewards(actor: "LLMRayActor", result: GenerationResult, exampl
     k_datasets = [example[VERIFIER_SOURCE_KEY]] * k
     k_raw_queries = [example[RAW_PROMPT_KEY]] * k
 
+    start_time = time.monotonic()
+    response_lengths = [len(response) for response in result.responses]
+    finish_reason_counts: dict[str, int] = {}
+    for reason in result.finish_reasons:
+        key = str(reason)
+        finish_reason_counts[key] = finish_reason_counts.get(key, 0) + 1
+    logger.info(
+        "Computing rewards: responses=%d response_tokens_min=%s response_tokens_max=%s "
+        "response_tokens_total=%s finish_reasons=%s dataset=%s",
+        k,
+        min(response_lengths) if response_lengths else 0,
+        max(response_lengths) if response_lengths else 0,
+        sum(response_lengths),
+        dict(sorted(finish_reason_counts.items())),
+        example.get(VERIFIER_SOURCE_KEY),
+    )
     scores, metrics = await actor.reward_fn(
         result.responses,
         decoded_responses,
@@ -549,6 +565,13 @@ async def compute_rewards(actor: "LLMRayActor", result: GenerationResult, exampl
         result.request_info,
         k_raw_queries,
         local_judge=actor,
+    )
+    logger.info(
+        "Computed rewards: responses=%d seconds=%.2f scores=%s metrics_keys=%s",
+        k,
+        time.monotonic() - start_time,
+        [round(float(score), 4) for score in scores],
+        sorted(metrics.keys()) if isinstance(metrics, dict) else type(metrics).__name__,
     )
     return scores, metrics
 
