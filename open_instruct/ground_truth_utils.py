@@ -1074,7 +1074,8 @@ class DeepSeekMathV2VerifierConfig(VerifierConfig):
     deepseekmath_v2_max_tokens: int = 92160
     deepseekmath_v2_max_context_length: int = 102400
     deepseekmath_v2_context_margin_tokens: int = 256
-    deepseekmath_v2_temperature: float = 0.0
+    deepseekmath_v2_temperature: float = 1.0
+    deepseekmath_v2_top_p: float = 0.95
     deepseekmath_v2_timeout: int = 60
     deepseekmath_v2_extra_body_json: str | None = None
     deepseekmath_v2_proof_weight: float = 0.76
@@ -1120,7 +1121,7 @@ class DeepSeekMathV2VerifierConfig(VerifierConfig):
         base_url = self.resolved_base_url() or ""
         if "openrouter.ai" in base_url and model.startswith("deepseek/"):
             return {
-                "reasoning": {"enabled": True},
+                "chat_template_kwargs": {"thinking": True, "reasoning_effort": "high"},
                 "provider": {"only": ["deepseek"], "allow_fallbacks": False},
             }
         return None
@@ -1366,6 +1367,7 @@ class DeepSeekMathV2Verifier(VerifierFunction):
             "model": model,
             "messages": messages,
             "temperature": self.config.deepseekmath_v2_temperature,
+            "top_p": self.config.deepseekmath_v2_top_p,
             "max_completion_tokens": max_completion_tokens,
             "timeout": self.config.deepseekmath_v2_timeout,
         }
