@@ -127,7 +127,9 @@ def main(
     pprint([args, model_config])
 
     oc_model_config = olmo_core_utils.ModelConfig(
-        model_name_or_path=model_config.model_name_or_path, attn_implementation=model_config.attn_implementation
+        model_name_or_path=model_config.olmo_core_model_checkpoint_path or model_config.model_name_or_path,
+        config_name=model_config.olmo_core_config_name,
+        attn_implementation=model_config.attn_implementation,
     )
     _, transformer_config = olmo_core_utils.setup_model(oc_model_config, tc, init_device="meta")
     olmo_core_utils.verify_can_save_as_hf(transformer_config, model_config.model_name_or_path)
@@ -241,10 +243,13 @@ def main(
         pg=pg,
         num_gpus_per_node=args.num_learners_per_node,
         model_name_or_path=model_config.model_name_or_path,
+        olmo_core_checkpoint_path=model_config.olmo_core_model_checkpoint_path,
+        olmo_core_config_name=model_config.olmo_core_config_name,
         grpo_config=args,
         max_sequence_length=streaming_config.max_prompt_token_length + streaming_config.response_length,
         streaming_config=streaming_config,
         vllm_config=vllm_config,
+        tokenizer_config=tc,
         tokenizer=tokenizer,
         attn_implementation=model_config.attn_implementation,
     )
@@ -342,8 +347,7 @@ def main(
     save_and_cleanup(args, tc, policy_group, tokenizer, beaker_config)
     logger.info("Finished GRPO training")
 
-
-if __name__ == "__main__":
+def cli_main() -> None:
     parser = utils.ArgumentParserPlus(
         [  # ty: ignore[invalid-argument-type]
             grpo_utils.GRPOExperimentConfig,
@@ -360,3 +364,7 @@ if __name__ == "__main__":
     args, tc, model_config, streaming_config, vllm_config, tools_config = parser.parse_args_into_dataclasses()
 
     main(args, tc, model_config, streaming_config, vllm_config, tools_config)  # type: ignore[arg-type]
+
+
+if __name__ == "__main__":
+    cli_main()

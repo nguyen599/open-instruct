@@ -37,6 +37,7 @@ from open_instruct.grpo_callbacks import (
     VLLMWeightSyncCallback,
     olmo_core_to_hf_name,
 )
+from open_instruct.dataset_transformation import TokenizerConfig
 from open_instruct.olmo_core_callbacks import BeakerCallbackV2
 from open_instruct.olmo_core_train_modules import GRPOTrainModule
 from open_instruct.utils import RayProcess, is_beaker_job, ray_get_with_progress
@@ -61,10 +62,13 @@ class PolicyTrainerOLMoCoreProcess(RayProcess):
         master_port: int | None,
         local_world_size: int,
         model_name_or_path: str,
+        olmo_core_checkpoint_path: str | None,
+        olmo_core_config_name: str | None,
         grpo_config: grpo_utils.GRPOExperimentConfig,
         max_sequence_length: int,
         streaming_config: data_loader_lib.StreamingDataLoaderConfig,
         vllm_config: data_loader_lib.VLLMConfig,
+        tokenizer_config: TokenizerConfig,
         tokenizer: transformers.PreTrainedTokenizer,
         attn_implementation: model_utils.AttentionBackendName,
     ):
@@ -72,10 +76,13 @@ class PolicyTrainerOLMoCoreProcess(RayProcess):
         self.local_world_size = local_world_size
         self.tokenizer = tokenizer
         self.model_name_or_path = model_name_or_path
+        self.olmo_core_checkpoint_path = olmo_core_checkpoint_path
+        self.olmo_core_config_name = olmo_core_config_name
         self.grpo_config = grpo_config
         self.max_sequence_length = max_sequence_length
         self.streaming_config = streaming_config
         self.vllm_config = vllm_config
+        self.tokenizer_config = tokenizer_config
         self.attn_implementation = attn_implementation
 
         self.ref_policy = None
@@ -124,11 +131,17 @@ class PolicyTrainerOLMoCoreProcess(RayProcess):
         torch_dtype = grpo_utils.TORCH_DTYPES[self.grpo_config.model_dtype]
         olmo_core_dtype = {"bfloat16": DType.bfloat16, "float32": DType.float32}[self.grpo_config.model_dtype]
 
+        olmo_core_model_name_or_path = self.olmo_core_checkpoint_path or self.model_name_or_path
         model_config_args = olmo_core_utils.ModelConfig(
-            model_name_or_path=self.model_name_or_path, attn_implementation=self.attn_implementation
+            model_name_or_path=olmo_core_model_name_or_path,
+            config_name=self.olmo_core_config_name,
+            attn_implementation=self.attn_implementation,
         )
-        logger.info(f"[Rank {self.rank}] Building OLMo-core model from {self.model_name_or_path}")
-        self.model, self.model_config = olmo_core_utils.setup_model(model_config_args)
+        logger.info(
+            f"[Rank {self.rank}] Building OLMo-core model from {olmo_core_model_name_or_path} "
+            f"(hf_base={self.model_name_or_path}, config_name={self.olmo_core_config_name})"
+        )
+        self.model, self.model_config = olmo_core_utils.setup_model(model_config_args, self.tokenizer_config)
 
         if self.grpo_config.load_ref_policy and self.grpo_config.beta > 0:
             logger.info(f"[Rank {self.rank}] Building reference policy...")
@@ -197,11 +210,18 @@ class PolicyTrainerOLMoCoreProcess(RayProcess):
         )
 
         # GRPOTrainModule.__init__ calls parallelize_model which reinitializes weights.
-        # We must reload HF weights after parallelization (FSDP-first loading pattern).
-        logger.info(f"[Rank {self.rank}] Reloading HuggingFace weights after parallelization...")
-        sd = self.train_module.model.state_dict()
-        load_hf_model(self.model_name_or_path, sd, work_dir=self.grpo_config.output_dir)
-        self.train_module.model.load_state_dict(sd)
+        # HF weights are reloaded immediately; native OLMo-core checkpoints are loaded
+        # through Trainer after the optimizer/checkpointer exists.
+        if self.olmo_core_checkpoint_path:
+            logger.info(
+                f"[Rank {self.rank}] Deferring native OLMo-core checkpoint load until Trainer setup: "
+                f"{self.olmo_core_checkpoint_path}"
+            )
+        else:
+            logger.info(f"[Rank {self.rank}] Reloading HuggingFace weights after parallelization...")
+            sd = self.train_module.model.state_dict()
+            load_hf_model(self.model_name_or_path, sd, work_dir=self.grpo_config.output_dir)
+            self.train_module.model.load_state_dict(sd)
 
         if self.grpo_config.single_gpu_mode:
             logger.info(f"[Rank {self.rank}] Converting model to {self.grpo_config.model_dtype} for single_gpu_mode")
@@ -390,6 +410,24 @@ class PolicyTrainerOLMoCoreProcess(RayProcess):
             checkpointer=CheckpointerConfig(save_thread_count=1, load_thread_count=32, throttle_uploads=True),
         ).build(self.train_module, self.dataloader)
 
+        loaded_existing_run = self.trainer.maybe_load_checkpoint(
+            save_folder,
+            load_trainer_state=True,
+            load_optim_state=True,
+        )
+        if loaded_existing_run:
+            logger.info(f"[Rank {self.rank}] Loaded existing GRPO checkpoint from save folder '{save_folder}'")
+        elif self.olmo_core_checkpoint_path:
+            logger.info(
+                f"[Rank {self.rank}] Loading initial native OLMo-core checkpoint "
+                f"'{self.olmo_core_checkpoint_path}' with optimizer state"
+            )
+            self.trainer.load_checkpoint(
+                self.olmo_core_checkpoint_path,
+                load_trainer_state=False,
+                load_optim_state=True,
+            )
+
         logger.info(f"[Rank {self.rank}] Starting trainer.fit() with callbacks: {list(trainer_callbacks.keys())}")
         self.trainer.fit()
         logger.info(f"[Rank {self.rank}] Training complete")
@@ -428,10 +466,13 @@ class OLMoCoreModelGroup:
         pg,
         num_gpus_per_node: list[int],
         model_name_or_path: str,
+        olmo_core_checkpoint_path: str | None,
+        olmo_core_config_name: str | None,
         grpo_config: grpo_utils.GRPOExperimentConfig,
         max_sequence_length: int,
         streaming_config: data_loader_lib.StreamingDataLoaderConfig,
         vllm_config: data_loader_lib.VLLMConfig,
+        tokenizer_config: TokenizerConfig,
         tokenizer: transformers.PreTrainedTokenizer,
         attn_implementation: model_utils.AttentionBackendName,
     ):
@@ -454,10 +495,13 @@ class OLMoCoreModelGroup:
         common_kwargs = {
             "world_size": world_size,
             "model_name_or_path": model_name_or_path,
+            "olmo_core_checkpoint_path": olmo_core_checkpoint_path,
+            "olmo_core_config_name": olmo_core_config_name,
             "grpo_config": grpo_config,
             "max_sequence_length": max_sequence_length,
             "streaming_config": streaming_config,
             "vllm_config": vllm_config,
+            "tokenizer_config": tokenizer_config,
             "tokenizer": tokenizer,
             "attn_implementation": attn_implementation,
         }

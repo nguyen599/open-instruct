@@ -183,6 +183,10 @@ class Batch:
 class ModelConfig:
     model_name_or_path: str
     """The model checkpoint for weights initialization."""
+    olmo_core_model_checkpoint_path: str | None = None
+    """Optional native OLMo-core checkpoint used to initialize OLMo-core GRPO learners."""
+    olmo_core_config_name: str | None = None
+    """OLMo-core TransformerConfig name used with native OLMo-core learner checkpoints."""
     model_revision: str | None = None
     """The specific model version to use (can be a branch name, tag name or commit id)."""
     dtype: str | None = None
