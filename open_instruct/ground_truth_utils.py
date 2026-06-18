@@ -1076,7 +1076,7 @@ class DeepSeekMathV2VerifierConfig(VerifierConfig):
     deepseekmath_v2_max_tokens: int = 92160
     deepseekmath_v2_max_context_length: int = 102400
     deepseekmath_v2_context_margin_tokens: int = 256
-    deepseekmath_v2_temperature: float = 1.0
+    deepseekmath_v2_temperature: float = 0.7
     deepseekmath_v2_top_p: float = 0.95
     deepseekmath_v2_timeout: int = 60
     deepseekmath_v2_extra_body_json: str | None = None
