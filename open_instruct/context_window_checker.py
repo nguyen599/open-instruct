@@ -45,6 +45,7 @@ def get_encoding_for_model(model_name: str):
         or "gpt-3.5" in model_name_lower
         or "claude" in model_name_lower
         or "minimax" in model_name_lower
+        or "deepseek" in model_name_lower
     ):
         return tiktoken.get_encoding("cl100k_base")
 

@@ -1073,6 +1073,7 @@ class DeepSeekMathV2VerifierConfig(VerifierConfig):
     deepseekmath_v2_meta_prompt_template_file: str | None = None
     deepseekmath_v2_max_tokens: int = 92160
     deepseekmath_v2_max_context_length: int = 102400
+    deepseekmath_v2_context_margin_tokens: int = 256
     deepseekmath_v2_temperature: float = 0.0
     deepseekmath_v2_timeout: int = 60
     deepseekmath_v2_extra_body_json: str | None = None
@@ -1296,22 +1297,65 @@ class DeepSeekMathV2Verifier(VerifierFunction):
             + PRICE_PER_MILLION_TOKENS.get(model_name, {}).get("output", 0) * usage.completion_tokens
         ) / 1_000_000
 
-    async def _call_judge(self, prompt: str, model: str) -> tuple[str, float]:
-        messages = build_messages(prompt)
-        if not context_window_checker.check_context_window_limit(
-            messages=messages,
-            max_completion_tokens=self.config.deepseekmath_v2_max_tokens,
-            model_name=model,
-            max_context_length=self.config.deepseekmath_v2_max_context_length,
-            safety_margin=150,
-        ):
+    @staticmethod
+    def _estimate_messages_tokens(messages: list[dict[str, str]], model: str) -> tuple[int, str]:
+        try:
+            encoding = context_window_checker.get_encoding_for_model(model)
+            total_tokens = 0
+            for message in messages:
+                role_tokens = 4 if message.get("role") == "system" else 3
+                total_tokens += len(encoding.encode(message.get("content", "") or "")) + role_tokens
+            return total_tokens, encoding.name
+        except Exception as exc:
+            total_chars = sum(len(message.get("content", "") or "") for message in messages)
+            logger.warning("DeepSeekMath-V2 judge token estimate failed for %s: %s; using chars/4 fallback.", model, exc)
+            return max(1, total_chars // 4), "chars_per_4"
+
+    def _effective_judge_max_tokens(
+        self,
+        messages: list[dict[str, str]],
+        model: str,
+        stage: str,
+    ) -> tuple[list[dict[str, str]], int]:
+        prompt_tokens, tokenizer_name = self._estimate_messages_tokens(messages, model)
+        context_length = self.config.deepseekmath_v2_max_context_length
+        margin = max(0, self.config.deepseekmath_v2_context_margin_tokens)
+        configured_max_tokens = max(1, self.config.deepseekmath_v2_max_tokens)
+        effective_max_tokens = min(configured_max_tokens, max(1, context_length - prompt_tokens - margin))
+        truncated = False
+
+        if prompt_tokens + margin + effective_max_tokens > context_length:
             messages = context_window_checker.truncate_messages_to_fit_context(
                 messages=messages,
-                max_completion_tokens=self.config.deepseekmath_v2_max_tokens,
+                max_completion_tokens=effective_max_tokens,
                 model_name=model,
-                max_context_length=self.config.deepseekmath_v2_max_context_length,
-                safety_margin=200,
+                max_context_length=context_length,
+                safety_margin=margin,
             )
+            truncated = True
+            prompt_tokens, tokenizer_name = self._estimate_messages_tokens(messages, model)
+            effective_max_tokens = min(configured_max_tokens, max(1, context_length - prompt_tokens - margin))
+
+        logger.info(
+            "DeepSeekMath-V2 judge budget stage=%s model=%s prompt_tokens=%d tokenizer=%s "
+            "configured_max_tokens=%d effective_max_tokens=%d context_length=%d margin=%d "
+            "prompt_chars=%d truncated=%s",
+            stage,
+            model,
+            prompt_tokens,
+            tokenizer_name,
+            configured_max_tokens,
+            effective_max_tokens,
+            context_length,
+            margin,
+            sum(len(message.get("content", "") or "") for message in messages),
+            truncated,
+        )
+        return messages, effective_max_tokens
+
+    async def _call_judge(self, prompt: str, model: str, stage: str) -> tuple[str, float]:
+        messages = build_messages(prompt)
+        messages, max_completion_tokens = self._effective_judge_max_tokens(messages, model, stage)
 
         client = LMJudgeVerifier._client_for_values(
             self.config.resolved_base_url(),
@@ -1322,7 +1366,7 @@ class DeepSeekMathV2Verifier(VerifierFunction):
             "model": model,
             "messages": messages,
             "temperature": self.config.deepseekmath_v2_temperature,
-            "max_completion_tokens": self.config.deepseekmath_v2_max_tokens,
+            "max_completion_tokens": max_completion_tokens,
             "timeout": self.config.deepseekmath_v2_timeout,
         }
         extra_body = self.config.extra_body(model)
@@ -1373,6 +1417,7 @@ class DeepSeekMathV2Verifier(VerifierFunction):
             proof_content, proof_cost = await self._call_judge(
                 self._render_template(self.proof_prompt_template, values),
                 self.config.proof_model(),
+                "proof",
             )
             total_cost += proof_cost
             proof_score = self._extract_score(proof_content)
@@ -1413,6 +1458,7 @@ class DeepSeekMathV2Verifier(VerifierFunction):
             meta_content, meta_cost = await self._call_judge(
                 self._render_template(self.meta_prompt_template, values),
                 self.config.meta_model(),
+                "meta",
             )
             total_cost += meta_cost
             self_eval_score = self._extract_score(meta_content)

@@ -486,6 +486,7 @@ class StreamingDataLoaderConfig:
     deepseekmath_v2_meta_prompt_template_file: str | None = None
     deepseekmath_v2_max_tokens: int = 92160
     deepseekmath_v2_max_context_length: int = 102400
+    deepseekmath_v2_context_margin_tokens: int = 256
     deepseekmath_v2_temperature: float = 0.0
     deepseekmath_v2_timeout: int = 60
     deepseekmath_v2_extra_body_json: str | None = None

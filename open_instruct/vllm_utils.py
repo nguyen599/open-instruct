@@ -228,6 +228,8 @@ def assert_threaded_actor(instance):
     Raises:
         AssertionError: If the class defines one or more async methods, or a running asyncio event loop is detected.
     """
+    if os.environ.get("OPEN_INSTRUCT_ALLOW_ASYNCIO_RAY_ACTOR", "0").strip().lower() in {"1", "true", "yes", "on"}:
+        return
     try:
         loop = asyncio.get_running_loop()
         raise AssertionError(
