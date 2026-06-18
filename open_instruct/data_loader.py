@@ -484,6 +484,7 @@ class StreamingDataLoaderConfig:
     deepseekmath_v2_proof_prompt_template_file: str | None = None
     deepseekmath_v2_meta_prompt_template: str | None = None
     deepseekmath_v2_meta_prompt_template_file: str | None = None
+    deepseekmath_v2_judge_backend: Literal["api", "local_vllm"] = "api"
     deepseekmath_v2_max_tokens: int = 92160
     deepseekmath_v2_max_context_length: int = 102400
     deepseekmath_v2_context_margin_tokens: int = 256

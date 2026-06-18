@@ -1071,6 +1071,7 @@ class DeepSeekMathV2VerifierConfig(VerifierConfig):
     deepseekmath_v2_proof_prompt_template_file: str | None = None
     deepseekmath_v2_meta_prompt_template: str | None = None
     deepseekmath_v2_meta_prompt_template_file: str | None = None
+    deepseekmath_v2_judge_backend: Literal["api", "local_vllm"] = "api"
     deepseekmath_v2_max_tokens: int = 92160
     deepseekmath_v2_max_context_length: int = 102400
     deepseekmath_v2_context_margin_tokens: int = 256
@@ -1137,7 +1138,7 @@ class DeepSeekMathV2ParsedResponse:
 
 
 class DeepSeekMathV2Verifier(VerifierFunction):
-    """DeepSeekMath-V2-style proof reward with API proof and meta-verification judges."""
+    """DeepSeekMath-V2-style proof reward with API or local-vLLM proof/meta judges."""
 
     SCORE_VALUES = (0.0, 0.5, 1.0)
 
@@ -1354,9 +1355,40 @@ class DeepSeekMathV2Verifier(VerifierFunction):
         )
         return messages, effective_max_tokens
 
-    async def _call_judge(self, prompt: str, model: str, stage: str) -> tuple[str, float]:
+    async def _call_judge(
+        self,
+        prompt: str,
+        model: str,
+        stage: str,
+        rollout_state: dict | None = None,
+    ) -> tuple[str, float]:
+        local_judge = None
+        if self.config.deepseekmath_v2_judge_backend == "local_vllm":
+            local_judge = (rollout_state or {}).get("_local_judge_actor")
+            if local_judge is None:
+                raise ValueError(
+                    "DeepSeekMath-V2 local_vllm judge backend requires a local vLLM actor. "
+                    "This backend is only supported inside grpo_fast rollout actors."
+                )
+            model = getattr(local_judge, "model_name", None) or model
+
         messages = build_messages(prompt)
         messages, max_completion_tokens = self._effective_judge_max_tokens(messages, model, stage)
+        if self.config.deepseekmath_v2_judge_backend == "local_vllm":
+            client = getattr(local_judge, "client", None)
+            if client is None:
+                raise ValueError("DeepSeekMath-V2 local_vllm judge backend could not find actor.client.")
+            request_kwargs = {
+                "model": model,
+                "messages": messages,
+                "temperature": self.config.deepseekmath_v2_temperature,
+                "top_p": self.config.deepseekmath_v2_top_p,
+                "max_tokens": max_completion_tokens,
+                "timeout": self.config.deepseekmath_v2_timeout,
+            }
+            response = await client.chat.completions.create(**request_kwargs)
+            content = response.choices[0].message.content or ""
+            return content, 0.0
 
         client = LMJudgeVerifier._client_for_values(
             self.config.resolved_base_url(),
@@ -1420,6 +1452,7 @@ class DeepSeekMathV2Verifier(VerifierFunction):
                 self._render_template(self.proof_prompt_template, values),
                 self.config.proof_model(),
                 "proof",
+                rollout_state=rollout_state,
             )
             total_cost += proof_cost
             proof_score = self._extract_score(proof_content)
@@ -1461,6 +1494,7 @@ class DeepSeekMathV2Verifier(VerifierFunction):
                 self._render_template(self.meta_prompt_template, values),
                 self.config.meta_model(),
                 "meta",
+                rollout_state=rollout_state,
             )
             total_cost += meta_cost
             self_eval_score = self._extract_score(meta_content)
@@ -1940,11 +1974,17 @@ async def apply_verifiable_reward(
     reward_mult: float = 1.0,
     queries: list[str] | None = None,
     rollout_states: list[dict | None] | None = None,
+    local_judge: Any | None = None,
 ):
     if queries is None:
         queries = [None] * len(responses)
     if rollout_states is None:
         rollout_states = [None] * len(responses)
+    if local_judge is not None:
+        rollout_states = [
+            {**(state or {}), "_local_judge_actor": local_judge}
+            for state in rollout_states
+        ]
 
     async_tasks = []
     task_metadata = []
@@ -2027,6 +2067,7 @@ class RewardConfig:
             finish_reasons: list[str],
             infos,
             queries: list[str] | None = None,
+            local_judge: Any | None = None,
         ) -> tuple[list[float], dict[str, Any]]:
             timeouts = infos.timeouts
             tool_errors = infos.tool_errors
@@ -2059,6 +2100,7 @@ class RewardConfig:
                     reward_mult=self.verification_reward,
                     queries=queries,
                     rollout_states=rollout_states,
+                    local_judge=local_judge,
                 )
                 if len(verifiable_rewards) != len(scores):
                     raise ValueError(f"{len(verifiable_rewards)=} != {len(scores)=}")

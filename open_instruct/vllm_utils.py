@@ -548,6 +548,7 @@ async def compute_rewards(actor: "LLMRayActor", result: GenerationResult, exampl
         result.finish_reasons,
         result.request_info,
         k_raw_queries,
+        local_judge=actor,
     )
     return scores, metrics
 
