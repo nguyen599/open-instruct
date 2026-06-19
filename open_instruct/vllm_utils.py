@@ -23,6 +23,7 @@ import json
 import os
 import queue
 import re
+import socket
 import sys
 import threading
 import time
@@ -603,6 +604,30 @@ async def finalize_completed_request(actor: "LLMRayActor", base_request_id: str)
         actor.request_outputs[base_request_id]["use_tools"],
         actor.request_metadata,
         dataset_lookup=_dataset_lookup,
+    )
+    generation_seconds = max(result.token_statistics.generation_time, 1e-9)
+    response_lengths = [len(response) for response in result.responses]
+    logger.info(
+        "vLLM generation complete host=%s prompt_id=%s index=%s eval=%s samples=%d "
+        "prompt_tokens=%d response_tokens_total=%d response_tokens_min=%d "
+        "response_tokens_max=%d seconds=%.2f tokens_per_second=%.2f "
+        "tokens_per_second_per_sample=%.2f finish_reasons=%s model_step=%s",
+        socket.gethostname(),
+        result.prompt_id,
+        result.index,
+        is_eval,
+        len(result.responses),
+        result.token_statistics.num_prompt_tokens,
+        result.token_statistics.num_response_tokens,
+        min(response_lengths) if response_lengths else 0,
+        max(response_lengths) if response_lengths else 0,
+        generation_seconds,
+        result.token_statistics.num_response_tokens / generation_seconds,
+        (result.token_statistics.num_response_tokens / generation_seconds / len(result.responses))
+        if result.responses
+        else 0.0,
+        dict(sorted({str(reason): result.finish_reasons.count(reason) for reason in result.finish_reasons}.items())),
+        result.model_step,
     )
 
     actor.request_outputs.pop(base_request_id)
