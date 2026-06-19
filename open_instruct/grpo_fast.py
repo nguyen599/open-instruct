@@ -371,7 +371,13 @@ def _policy_trainer_ray_process_from_pretrained_impl(
         optim_params = local_get_optimizer_grouped_parameters(self.policy, args.weight_decay)
     else:
         optim_params = self.policy.parameters()
-    self.optimizer = torch.optim.AdamW(optim_params, lr=args.learning_rate, fused=args.fused_optimizer)
+    if args.deepspeed_offload_optimizer:
+        from deepspeed.ops.adam import DeepSpeedCPUAdam
+
+        local_logger.info("Using DeepSpeedCPUAdam because --deepspeed_offload_optimizer is enabled.")
+        self.optimizer = DeepSpeedCPUAdam(optim_params, lr=args.learning_rate, adamw_mode=True)
+    else:
+        self.optimizer = torch.optim.AdamW(optim_params, lr=args.learning_rate, fused=args.fused_optimizer)
     num_scheduler_steps = args.num_training_steps * args.num_epochs * args.num_mini_batches
     warmup_steps = int(num_scheduler_steps * args.warmup_ratio)
     scheduler = local_get_scheduler(
