@@ -499,6 +499,7 @@ class StreamingDataLoaderConfig:
     deepseekmath_v2_extra_body_json: str | None = None
     deepseekmath_v2_proof_weight: float = 0.76
     deepseekmath_v2_self_eval_weight: float = 0.24
+    deepseekmath_v2_partial_format_score: float = 0.7
     deepseekmath_v2_enable_meta_verification: bool = True
     deepseekmath_v2_require_format: bool = True
 

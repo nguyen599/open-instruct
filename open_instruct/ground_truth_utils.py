@@ -1144,6 +1144,7 @@ class DeepSeekMathV2VerifierConfig(VerifierConfig):
     deepseekmath_v2_extra_body_json: str | None = None
     deepseekmath_v2_proof_weight: float = 0.76
     deepseekmath_v2_self_eval_weight: float = 0.24
+    deepseekmath_v2_partial_format_score: float = 0.7
     deepseekmath_v2_enable_meta_verification: bool = True
     deepseekmath_v2_require_format: bool = True
     seed: int = 42
@@ -1247,6 +1248,16 @@ class DeepSeekMathV2Verifier(VerifierFunction):
         for key, value in values.items():
             rendered = rendered.replace("{" + key + "}", "" if value is None else str(value))
         return rendered
+
+    def _format_score(self, parsed: DeepSeekMathV2ParsedResponse, fatal_format_errors: list[str]) -> float:
+        if fatal_format_errors:
+            return 0.0
+        if parsed.format_ok:
+            return 1.0
+        # A common long-context failure mode is generating a complete proof but
+        # running out of tokens before the self-evaluation section or boxed
+        # self-score. Keep partial credit for proof quality, but penalize format.
+        return max(0.0, min(1.0, self.config.deepseekmath_v2_partial_format_score))
 
     @classmethod
     def _normalize_score(cls, value: Any) -> float | None:
@@ -1786,12 +1797,14 @@ class DeepSeekMathV2Verifier(VerifierFunction):
     ) -> VerificationResult:
         parsed = self.parse_prediction(prediction)
         fatal_format_errors = [error for error in parsed.format_errors if error in self.FATAL_FORMAT_ERRORS]
+        format_score = self._format_score(parsed, fatal_format_errors)
         if self.config.deepseekmath_v2_require_format and fatal_format_errors:
             return VerificationResult(
                 score=0.0,
                 reasoning=json.dumps(
                     {
                         "format_ok": False,
+                        "format_score": format_score,
                         "format_errors": parsed.format_errors,
                         "fatal_format_errors": fatal_format_errors,
                         "proof_score": None,
@@ -1860,13 +1873,14 @@ class DeepSeekMathV2Verifier(VerifierFunction):
                 )
 
             if not self.config.deepseekmath_v2_enable_meta_verification:
-                reward = proof_score
+                reward = format_score * proof_score
                 return VerificationResult(
                     score=reward,
                     cost=total_cost,
                     reasoning=json.dumps(
                         {
                             "format_ok": parsed.format_ok,
+                            "format_score": format_score,
                             "format_errors": parsed.format_errors,
                             "proof_score": proof_score,
                             "self_score": parsed.self_score,
@@ -1894,10 +1908,11 @@ class DeepSeekMathV2Verifier(VerifierFunction):
                 self_eval_score = 0.0
             self_score = parsed.self_score if parsed.self_score is not None else 0.0
             score_alignment = max(0.0, 1.0 - abs(self_score - proof_score))
-            reward = (
+            base_reward = (
                 self.config.deepseekmath_v2_proof_weight * proof_score
                 + self.config.deepseekmath_v2_self_eval_weight * score_alignment * self_eval_score
             )
+            reward = format_score * base_reward
             reward = max(0.0, min(1.0, reward))
 
             return VerificationResult(
@@ -1906,11 +1921,13 @@ class DeepSeekMathV2Verifier(VerifierFunction):
                 reasoning=json.dumps(
                     {
                         "format_ok": parsed.format_ok,
+                        "format_score": format_score,
                         "format_errors": parsed.format_errors,
                         "proof_score": proof_score,
                         "self_score": parsed.self_score,
                         "self_eval_score": self_eval_score,
                         "score_alignment": score_alignment,
+                        "base_reward": base_reward,
                         "reward": reward,
                         "nonfatal_format_errors_allowed": bool(parsed.format_errors),
                     },
