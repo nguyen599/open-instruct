@@ -1836,6 +1836,14 @@ class DeepSeekMathV2Verifier(VerifierFunction):
             total_cost += proof_cost
             proof_score = self._extract_score(proof_content)
             if proof_score is None:
+                logger.warning(
+                    "DeepSeekMath-V2 proof judge returned no parseable score; "
+                    "solution_chars=%d self_evaluation_chars=%d format_errors=%s response_chars=%d",
+                    len(parsed.solution),
+                    len(parsed.self_evaluation),
+                    parsed.format_errors,
+                    len(proof_content or ""),
+                )
                 return VerificationResult(
                     score=0.0,
                     cost=total_cost,
@@ -1845,6 +1853,7 @@ class DeepSeekMathV2Verifier(VerifierFunction):
                             "format_errors": parsed.format_errors,
                             "error": "missing_or_invalid_proof_judge_score",
                             "proof_judge_response": proof_content[:1000],
+                            "proof_judge_response_tail": proof_content[-1000:],
                         },
                         ensure_ascii=False,
                     ),

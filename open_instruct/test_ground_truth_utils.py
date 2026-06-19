@@ -579,6 +579,84 @@ This self evaluation has no required score phrase, but the proof should still be
         self.assertIn("missing_score_phrase", payload["format_errors"])
         self.assertTrue(payload["nonfatal_format_errors_allowed"])
 
+    def test_reward_config_scores_solution_even_with_nonfatal_self_eval_format_error(self):
+        prediction = """<think>hidden scratchpad</think>
+
+# Solution
+VISIBLE_REWARD_CONFIG_SOLUTION
+
+# Self Evaluate
+The proof is good, but this section intentionally omits the required score phrase.
+"""
+        verifier = DeepSeekMathV2Verifier(self.config)
+        verifier._call_judge = AsyncMock(
+            side_effect=[
+                (r"Here is my evaluation of the solution: correct.\n\n\boxed{1}", 0.0),
+                (r"Here is my analysis of the solution evaluation: malformed self-eval.\n\n\boxed{0}", 0.0),
+            ]
+        )
+        reward_fn = ground_truth_utils.RewardConfig(
+            apply_verifiable_reward=True,
+            verification_reward=1.0,
+            verifier_functions={"proof_math": verifier},
+        ).build()
+        infos = SimpleNamespace(
+            timeouts=[False],
+            tool_errors=[False],
+            tool_outputs=[[]],
+            tool_calleds=[False],
+            rollout_states=[{}],
+        )
+
+        scores, metrics = asyncio.run(
+            reward_fn(
+                responses=[[]],
+                decoded_responses=[prediction],
+                ground_truths=[{"problem": "prove this"}],
+                datasets=["proof_math"],
+                finish_reasons=["stop"],
+                infos=infos,
+                queries=["prove this"],
+            )
+        )
+
+        self.assertAlmostEqual(scores[0], 0.76)
+        self.assertAlmostEqual(metrics["objective/verifiable_reward"], 0.76)
+        self.assertAlmostEqual(metrics["objective/deepseekmath_v2_reward"], 0.76)
+        self.assertEqual(verifier._call_judge.await_count, 2)
+        proof_prompt = verifier._call_judge.await_args_list[0].args[0]
+        meta_prompt = verifier._call_judge.await_args_list[1].args[0]
+        self.assertIn("VISIBLE_REWARD_CONFIG_SOLUTION", proof_prompt)
+        self.assertNotIn("hidden scratchpad", proof_prompt)
+        self.assertNotIn("intentionally omits the required score phrase", proof_prompt)
+        self.assertIn("intentionally omits the required score phrase", meta_prompt)
+
+    def test_async_call_reports_missing_proof_judge_score_after_successful_solution_parse(self):
+        verifier = DeepSeekMathV2Verifier(self.config)
+        verifier._call_judge = AsyncMock(
+            return_value=(
+                "The solution looks plausible, but this judge response never emits a boxed score. " * 80,
+                0.0,
+            )
+        )
+
+        result = asyncio.run(
+            verifier.async_call(
+                tokenized_prediction=[],
+                prediction=self.formatted_prediction("1"),
+                label={"problem": "prove this"},
+                query=None,
+            )
+        )
+
+        self.assertEqual(result.score, 0.0)
+        self.assertEqual(verifier._call_judge.await_count, 1)
+        payload = ground_truth_utils.json.loads(result.reasoning)
+        self.assertTrue(payload["format_ok"])
+        self.assertEqual(payload["format_errors"], [])
+        self.assertEqual(payload["error"], "missing_or_invalid_proof_judge_score")
+        self.assertIn("proof_judge_response_tail", payload)
+
     def test_async_call_returns_zero_without_required_format(self):
         create_mock = AsyncMock()
         client = SimpleNamespace(
