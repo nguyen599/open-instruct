@@ -1429,6 +1429,9 @@ def create_model_and_optimizer(
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         vllm_attention_backend=vllm_config.vllm_attention_backend,
+        vllm_dtype=vllm_config.vllm_dtype,
+        vllm_quantization=vllm_config.vllm_quantization,
+        vllm_kv_cache_dtype=vllm_config.vllm_kv_cache_dtype,
         disable_custom_all_reduce=vllm_config.vllm_disable_custom_all_reduce,
     )
     logger.info("======== ✅ vLLM engines and actor_manager initialized =========")

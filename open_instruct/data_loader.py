@@ -397,6 +397,9 @@ class VLLMConfig:
     vllm_enforce_eager: bool = False
     vllm_disable_custom_all_reduce: bool = False
     vllm_attention_backend: str | None = None
+    vllm_dtype: str = "bfloat16"
+    vllm_quantization: str | None = None
+    vllm_kv_cache_dtype: str = "auto"
     vllm_sync_backend: str = "nccl"
     vllm_gpu_memory_utilization: float = 0.9
     vllm_enable_prefix_caching: bool = False

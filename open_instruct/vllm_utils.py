@@ -1447,6 +1447,9 @@ def create_vllm_engines(
     eval_dataset=None,
     trust_remote_code: bool = False,
     vllm_attention_backend: str | None = None,
+    vllm_dtype: str = "bfloat16",
+    vllm_quantization: str | None = None,
+    vllm_kv_cache_dtype: str = "auto",
     disable_custom_all_reduce: bool = False,
 ) -> list[ray.actor.ActorHandle]:
     vllm_engines = []
@@ -1508,9 +1511,9 @@ def create_vllm_engines(
                 weight_transfer_config=WeightTransferConfig(backend="ipc" if use_hybrid_engine else "nccl"),
                 tensor_parallel_size=tensor_parallel_size,
                 enforce_eager=enforce_eager,
-                dtype="bfloat16",
-                quantization=None,
-                kv_cache_dtype="auto",
+                dtype=vllm_dtype,
+                quantization=vllm_quantization,
+                kv_cache_dtype=vllm_kv_cache_dtype,
                 seed=seed + i,
                 distributed_executor_backend=distributed_executor_backend,
                 enable_prefix_caching=enable_prefix_caching,
@@ -1542,13 +1545,16 @@ def create_vllm_engines(
             )
         )
         logger.info(
-            "Queued vLLM engine %d/%d: model=%s tokenizer=%s tensor_parallel_size=%d dtype=bfloat16 "
-            "quantization=None kv_cache_dtype=auto max_model_len=%d disable_custom_all_reduce=%s",
+            "Queued vLLM engine %d/%d: model=%s tokenizer=%s tensor_parallel_size=%d dtype=%s "
+            "quantization=%s kv_cache_dtype=%s max_model_len=%d disable_custom_all_reduce=%s",
             i + 1,
             num_engines,
             pretrain,
             tokenizer_name_or_path,
             tensor_parallel_size,
+            vllm_dtype,
+            vllm_quantization,
+            vllm_kv_cache_dtype,
             max_model_len,
             disable_custom_all_reduce,
         )
