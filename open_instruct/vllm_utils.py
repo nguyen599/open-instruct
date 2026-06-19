@@ -81,6 +81,20 @@ def _prompt_log_max_chars() -> int:
         return 0
 
 
+def _rollout_log_max_chars() -> int:
+    try:
+        return int(os.environ.get("OPEN_INSTRUCT_ROLLOUT_LOG_MAX_CHARS", "12000"))
+    except ValueError:
+        return 12000
+
+
+def _rollout_log_max_samples() -> int:
+    try:
+        return max(0, int(os.environ.get("OPEN_INSTRUCT_ROLLOUT_LOG_MAX_SAMPLES", "1")))
+    except ValueError:
+        return 1
+
+
 def _clip_prompt_preview(text: str, max_chars: int) -> tuple[str, bool]:
     raw = str(text or "")
     if max_chars <= 0 or len(raw) <= max_chars:
@@ -132,6 +146,67 @@ def _write_prompt_preview(stage: str, name: str, text: str, metadata: dict[str, 
         )
     except Exception:
         logger.exception("Failed to write prompt preview stage=%s name=%s", stage, name)
+
+
+def _log_rollout_response_previews(
+    actor: "LLMRayActor",
+    result: GenerationResult,
+    is_eval: bool,
+) -> None:
+    max_samples = min(_rollout_log_max_samples(), len(result.responses))
+    if max_samples <= 0:
+        return
+    try:
+        raw_texts = actor.llm_engine.tokenizer.batch_decode(result.responses[:max_samples], skip_special_tokens=False)
+        visible_texts = actor.llm_engine.tokenizer.batch_decode(
+            result.responses[:max_samples], skip_special_tokens=True
+        )
+        max_chars = _rollout_log_max_chars()
+        for sample_idx, (raw_text, visible_text) in enumerate(zip(raw_texts, visible_texts, strict=False)):
+            preview, clipped = _clip_prompt_preview(visible_text, max_chars)
+            metadata = {
+                "prompt_id": result.prompt_id,
+                "index": result.index,
+                "sample_idx": sample_idx,
+                "eval": is_eval,
+                "model_step": result.model_step,
+                "finish_reason": result.finish_reasons[sample_idx] if sample_idx < len(result.finish_reasons) else None,
+                "response_tokens": len(result.responses[sample_idx]),
+                "raw_chars": len(raw_text),
+                "visible_chars": len(visible_text),
+                "contains_end_think": "</think>" in visible_text,
+                "contains_solution_heading": "Solution:" in visible_text or "### Solution" in visible_text,
+                "contains_self_evaluation": "Self-evaluation" in visible_text or "Self Evaluation" in visible_text,
+                "preview_type": "visible_text",
+            }
+            logger.info(
+                "vLLM rollout response preview host=%s prompt_id=%s index=%s eval=%s sample=%d "
+                "tokens=%d raw_chars=%d visible_chars=%d finish_reason=%s contains_end_think=%s "
+                "contains_solution_heading=%s clipped=%s preview:\n%s",
+                socket.gethostname(),
+                result.prompt_id,
+                result.index,
+                is_eval,
+                sample_idx,
+                metadata["response_tokens"],
+                metadata["raw_chars"],
+                metadata["visible_chars"],
+                metadata["finish_reason"],
+                metadata["contains_end_think"],
+                metadata["contains_solution_heading"],
+                clipped,
+                preview,
+            )
+            _write_prompt_preview(
+                "rollout_response",
+                f"{result.prompt_id}_{sample_idx}",
+                "VISIBLE RESPONSE\n"
+                f"{visible_text}\n\nRAW RESPONSE\n"
+                f"{raw_text}",
+                metadata=metadata,
+            )
+    except Exception:
+        logger.exception("Failed to log rollout response preview for prompt_id=%s", result.prompt_id)
 
 # ---------------------------------------------------------------------------
 # Monkey-patch: vLLM 0.18.0 hybrid model dtype serialization bug
@@ -632,6 +707,7 @@ async def finalize_completed_request(actor: "LLMRayActor", base_request_id: str)
 
     actor.request_outputs.pop(base_request_id)
     actor.request_metadata.pop(base_request_id, None)
+    _log_rollout_response_previews(actor, result, is_eval)
 
     result.reward_scores, result.reward_metrics = await compute_rewards(actor, result, example)
     results_queue = actor.eval_results_queue if is_eval else actor.results_queue
@@ -1433,6 +1509,8 @@ def create_vllm_engines(
                 tensor_parallel_size=tensor_parallel_size,
                 enforce_eager=enforce_eager,
                 dtype="bfloat16",
+                quantization=None,
+                kv_cache_dtype="auto",
                 seed=seed + i,
                 distributed_executor_backend=distributed_executor_backend,
                 enable_prefix_caching=enable_prefix_caching,
@@ -1462,6 +1540,17 @@ def create_vllm_engines(
                 disable_custom_all_reduce=disable_custom_all_reduce,
                 language_model_only=True,
             )
+        )
+        logger.info(
+            "Queued vLLM engine %d/%d: model=%s tokenizer=%s tensor_parallel_size=%d dtype=bfloat16 "
+            "quantization=None kv_cache_dtype=auto max_model_len=%d disable_custom_all_reduce=%s",
+            i + 1,
+            num_engines,
+            pretrain,
+            tokenizer_name_or_path,
+            tensor_parallel_size,
+            max_model_len,
+            disable_custom_all_reduce,
         )
 
     utils.ray_get_with_progress(
