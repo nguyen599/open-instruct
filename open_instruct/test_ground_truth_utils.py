@@ -346,6 +346,91 @@ Based on my evaluation, the final overall score should be:
 \\boxed{{{self_score}}}
 """
 
+    def test_parse_prediction_uses_visible_solution_and_final_boxed_self_score(self):
+        prediction = r"""<think>
+Hidden chain of thought that must not be judged.
+## Solution
+Hidden proof should not survive parsing.
+</think>
+
+## Solution
+Visible proof only. Intermediate boxed math \boxed{99} is part of the proof.
+
+## Self Evaluation
+
+Here is my evaluation of the solution:
+The proof is mostly correct. A draft score was \boxed{1}.
+
+Based on my evaluation, the final overall score should be:
+\boxed{0.5}
+"""
+
+        parsed = DeepSeekMathV2Verifier.parse_prediction(prediction)
+
+        self.assertTrue(parsed.format_ok)
+        self.assertEqual(parsed.self_score, 0.5)
+        self.assertIn("Visible proof only", parsed.solution)
+        self.assertIn(r"\boxed{99}", parsed.solution)
+        self.assertNotIn("Hidden chain of thought", parsed.solution)
+        self.assertNotIn("Hidden proof should not survive parsing", parsed.solution)
+        self.assertIn("draft score", parsed.self_evaluation)
+
+    def test_async_call_forwards_only_visible_solution_to_proof_and_meta_judges(self):
+        prediction = r"""<think>HIDDEN_REASONING_SHOULD_NOT_BE_FORWARDED</think>
+
+## Solution
+VISIBLE_SOLUTION_FOR_JUDGE
+
+## Self Evaluation
+
+Here is my evaluation of the solution:
+SELF_EVALUATION_TEXT_FOR_META
+
+Based on my evaluation, the final overall score should be:
+\boxed{0.5}
+"""
+        create_mock = AsyncMock(
+            side_effect=[
+                _make_openai_response(r"Here is my evaluation of the solution: ok.\n\n\boxed{1}"),
+                _make_openai_response(r"Here is my analysis of the solution evaluation: ok.\n\n\boxed{1}"),
+            ]
+        )
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create_mock)),
+            close=AsyncMock(),
+        )
+
+        with (
+            patch("open_instruct.ground_truth_utils.AsyncOpenAI", return_value=client),
+            patch.object(
+                DeepSeekMathV2Verifier,
+                "_estimate_messages_tokens",
+                return_value=(100, "test-tokenizer"),
+            ),
+        ):
+            result = asyncio.run(
+                self.verifier.async_call(
+                    tokenized_prediction=[],
+                    prediction=prediction,
+                    label={"problem": "prove this"},
+                    query=None,
+                )
+            )
+
+        self.assertAlmostEqual(result.score, 0.88)
+        self.assertEqual(create_mock.await_count, 2)
+        proof_messages = create_mock.await_args_list[0].kwargs["messages"]
+        proof_prompt = "\n".join(message["content"] for message in proof_messages)
+        meta_messages = create_mock.await_args_list[1].kwargs["messages"]
+        meta_prompt = "\n".join(message["content"] for message in meta_messages)
+
+        self.assertIn("VISIBLE_SOLUTION_FOR_JUDGE", proof_prompt)
+        self.assertNotIn("SELF_EVALUATION_TEXT_FOR_META", proof_prompt)
+        self.assertNotIn("HIDDEN_REASONING_SHOULD_NOT_BE_FORWARDED", proof_prompt)
+        self.assertIn("VISIBLE_SOLUTION_FOR_JUDGE", meta_prompt)
+        self.assertIn("SELF_EVALUATION_TEXT_FOR_META", meta_prompt)
+        self.assertNotIn("HIDDEN_REASONING_SHOULD_NOT_BE_FORWARDED", meta_prompt)
+
     def test_async_call_computes_weighted_proof_and_meta_reward(self):
         create_mock = AsyncMock(
             side_effect=[
