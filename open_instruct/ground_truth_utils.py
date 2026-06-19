@@ -9,6 +9,7 @@ import ast
 import asyncio
 import copy
 import dataclasses
+import hashlib
 import json
 import logging
 import os
@@ -45,6 +46,66 @@ logger = logger_utils.setup_logger(__name__)
 
 logging.getLogger("cost_calculator").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
+def _prompt_log_max_chars() -> int:
+    try:
+        return int(os.environ.get("OPEN_INSTRUCT_PROMPT_LOG_MAX_CHARS", "0"))
+    except ValueError:
+        return 0
+
+
+def _clip_prompt_preview(text: str, max_chars: int) -> tuple[str, bool]:
+    raw = str(text or "")
+    if max_chars <= 0 or len(raw) <= max_chars:
+        return raw, False
+    marker = "\n\n[... clipped prompt middle ...]\n\n"
+    if max_chars <= len(marker) + 20:
+        return raw[:max_chars], True
+    head = (max_chars - len(marker)) // 2
+    tail = max_chars - len(marker) - head
+    return f"{raw[:head]}{marker}{raw[-tail:]}", True
+
+
+def _safe_prompt_log_name(value: object) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value or "unknown")).strip("._")
+    return cleaned or "unknown"
+
+
+def _write_prompt_preview(stage: str, name: str, text: str, metadata: dict[str, object] | None = None) -> None:
+    log_dir = os.environ.get("OPEN_INSTRUCT_PROMPT_LOG_DIR")
+    if not log_dir:
+        return
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        max_chars = _prompt_log_max_chars()
+        preview, clipped = _clip_prompt_preview(text, max_chars)
+        digest = hashlib.sha256(str(text or "").encode("utf-8", errors="ignore")).hexdigest()[:10]
+        path = os.path.join(log_dir, f"{_safe_prompt_log_name(stage)}_{_safe_prompt_log_name(name)}_{digest}.txt")
+        payload = {
+            "stage": stage,
+            "name": name,
+            "chars": len(str(text or "")),
+            "preview_chars": len(preview),
+            "clipped": clipped,
+            "sha256": hashlib.sha256(str(text or "").encode("utf-8", errors="ignore")).hexdigest(),
+        }
+        if metadata:
+            payload.update(metadata)
+        with open(path, "w", encoding="utf-8") as file_obj:
+            file_obj.write(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n\n")
+            file_obj.write(preview)
+            file_obj.write("\n")
+        logger.info(
+            "Prompt preview written stage=%s name=%s path=%s chars=%d clipped=%s",
+            stage,
+            name,
+            path,
+            payload["chars"],
+            clipped,
+        )
+    except Exception:
+        logger.exception("Failed to write prompt preview stage=%s name=%s", stage, name)
 
 
 @dataclasses.dataclass
@@ -1483,6 +1544,18 @@ class DeepSeekMathV2Verifier(VerifierFunction):
             model,
             stage,
             max_context_length_override=local_context_length,
+        )
+        _write_prompt_preview(
+            f"{stage}_judge",
+            f"pid{os.getpid()}_{time.time_ns()}",
+            "\n\n".join(f"{message.get('role', 'user')}:\n{message.get('content', '')}" for message in messages),
+            {
+                "model": model,
+                "backend": self.config.deepseekmath_v2_judge_backend,
+                "max_completion_tokens": max_completion_tokens,
+                "messages": len(messages),
+                "local_context_length": local_context_length,
+            },
         )
         start_time = time.monotonic()
         if self.config.deepseekmath_v2_judge_backend == "local_vllm":

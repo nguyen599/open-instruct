@@ -18,8 +18,11 @@
 import argparse
 import asyncio
 import dataclasses
+import hashlib
+import json
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -68,6 +71,66 @@ from open_instruct.environments.tools.parsers import ToolParser, create_tool_par
 from open_instruct.ground_truth_utils import RewardConfig
 
 logger = logger_utils.setup_logger(__name__)
+
+
+def _prompt_log_max_chars() -> int:
+    try:
+        return int(os.environ.get("OPEN_INSTRUCT_PROMPT_LOG_MAX_CHARS", "0"))
+    except ValueError:
+        return 0
+
+
+def _clip_prompt_preview(text: str, max_chars: int) -> tuple[str, bool]:
+    raw = str(text or "")
+    if max_chars <= 0 or len(raw) <= max_chars:
+        return raw, False
+    marker = "\n\n[... clipped prompt middle ...]\n\n"
+    if max_chars <= len(marker) + 20:
+        return raw[:max_chars], True
+    head = (max_chars - len(marker)) // 2
+    tail = max_chars - len(marker) - head
+    return f"{raw[:head]}{marker}{raw[-tail:]}", True
+
+
+def _safe_prompt_log_name(value: object) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value or "unknown")).strip("._")
+    return cleaned or "unknown"
+
+
+def _write_prompt_preview(stage: str, name: str, text: str, metadata: dict[str, object] | None = None) -> None:
+    log_dir = os.environ.get("OPEN_INSTRUCT_PROMPT_LOG_DIR")
+    if not log_dir:
+        return
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        max_chars = _prompt_log_max_chars()
+        preview, clipped = _clip_prompt_preview(text, max_chars)
+        digest = hashlib.sha256(str(text or "").encode("utf-8", errors="ignore")).hexdigest()[:10]
+        path = os.path.join(log_dir, f"{_safe_prompt_log_name(stage)}_{_safe_prompt_log_name(name)}_{digest}.txt")
+        payload = {
+            "stage": stage,
+            "name": name,
+            "chars": len(str(text or "")),
+            "preview_chars": len(preview),
+            "clipped": clipped,
+            "sha256": hashlib.sha256(str(text or "").encode("utf-8", errors="ignore")).hexdigest(),
+        }
+        if metadata:
+            payload.update(metadata)
+        with open(path, "w", encoding="utf-8") as file_obj:
+            file_obj.write(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n\n")
+            file_obj.write(preview)
+            file_obj.write("\n")
+        logger.info(
+            "Prompt preview written stage=%s name=%s path=%s chars=%d clipped=%s",
+            stage,
+            name,
+            path,
+            payload["chars"],
+            clipped,
+        )
+    except Exception:
+        logger.exception("Failed to write prompt preview stage=%s name=%s", stage, name)
 
 # ---------------------------------------------------------------------------
 # Monkey-patch: vLLM 0.18.0 hybrid model dtype serialization bug
@@ -447,6 +510,7 @@ def _prefetch_worker(actor: "LLMRayActor") -> None:
 def add_request(actor: "LLMRayActor", request: PromptRequest) -> None:
     request_id = make_request_id(request)
     sampling_params = dataclasses.replace(request.generation_config, n=1)
+    prompt_token_ids = list(request.prompt)
 
     actor.request_metadata[request_id] = {
         "is_eval": request.is_eval,
@@ -455,12 +519,29 @@ def add_request(actor: "LLMRayActor", request: PromptRequest) -> None:
         "model_step": actor.current_model_step,
         "sampling_params": sampling_params,
         "original_sampling_params": request.generation_config,
-        "prompt_token_ids": list(request.prompt),
+        "prompt_token_ids": prompt_token_ids,
         "start_time": time.perf_counter(),
         "active_tools": request.active_tools,
         "env_config": request.env_config,
         "ground_truth": request.ground_truth,
     }
+    try:
+        prompt_text = actor.llm_engine.tokenizer.decode(prompt_token_ids, skip_special_tokens=False)
+        _write_prompt_preview(
+            "eval_generation" if request.is_eval else "proof_generation",
+            request.prompt_id,
+            prompt_text,
+            {
+                "index": request.index,
+                "is_eval": request.is_eval,
+                "prompt_tokens": len(prompt_token_ids),
+                "samples_per_prompt": request.generation_config.n,
+                "max_tokens": request.generation_config.max_tokens,
+                "model_step": actor.current_model_step,
+            },
+        )
+    except Exception:
+        logger.exception("Failed to log generation prompt preview for request_id=%s", request_id)
 
     for j in range(request.generation_config.n):
         seed = request.generation_config.seed + j if request.generation_config.seed is not None else None
