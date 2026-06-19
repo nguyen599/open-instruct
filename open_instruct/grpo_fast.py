@@ -1142,6 +1142,40 @@ def setup_experiment_tracking(
     return beaker_config, wandb_url
 
 
+def live_wandb_rollout_logger(
+    args: grpo_utils.GRPOExperimentConfig,
+    data_prep_actor: ray.actor.ActorHandle,
+    stop_event: threading.Event,
+) -> None:
+    if not args.with_tracking:
+        return
+
+    interval = float(os.environ.get("OPEN_INSTRUCT_WANDB_LIVE_INTERVAL_SECONDS", "30"))
+    last_logged_step = -1
+    logger.info("Live W&B rollout logger started with interval %.1fs", interval)
+    while not stop_event.wait(interval):
+        try:
+            snapshot = ray.get(data_prep_actor.get_latest_scalar_metrics.remote(), timeout=5.0)
+        except Exception as exc:
+            logger.debug("Live W&B rollout logger poll failed: %s", exc)
+            continue
+        if not snapshot:
+            continue
+
+        prepared_step = int(snapshot["prepared_step"])
+        if prepared_step <= last_logged_step:
+            continue
+        metrics = snapshot.get("metrics") or {}
+        metrics_to_log = {
+            "training_step": int(snapshot["training_step"]),
+            "live/prepared_step": prepared_step,
+            **{f"live/{key}": value for key, value in metrics.items()},
+        }
+        wandb.log(metrics_to_log, step=int(snapshot["training_step"]))
+        last_logged_step = prepared_step
+        logger.info("Live W&B rollout metrics logged for prepared_step=%s", prepared_step)
+
+
 def _validate_and_log_dataset_tools(dataset, configured_tool_names: list[str] | None, dataset_name: str) -> None:
     """Validate and log per-sample tool configuration for a dataset."""
     if dataset and TOOLS_COLUMN_KEY in dataset.column_names and configured_tool_names:
@@ -2417,6 +2451,8 @@ def main(
 
     stop_event = threading.Event()
     executor = futures.ThreadPoolExecutor(max_workers=3, thread_name_prefix="grpo")
+    if args.with_tracking:
+        executor.submit(live_wandb_rollout_logger, args, _data_prep_actor, stop_event)
 
     try:
         episode = run_training(

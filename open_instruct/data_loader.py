@@ -1600,6 +1600,18 @@ class DataPreparationActor:
                 )
             time.sleep(0.01)
 
+    def get_latest_scalar_metrics(self) -> dict[str, Any] | None:
+        with self.lock:
+            step = self.current_prepared_step
+            if step < 0 or step not in self.metrics:
+                return None
+            scalar_metrics = {
+                key: float(value)
+                for key, value in self.metrics[step].items()
+                if isinstance(value, int | float | np.integer | np.floating)
+            }
+        return {"prepared_step": step, "training_step": step + 1, "metrics": scalar_metrics}
+
     def _cleanup_old_steps(self, current_step: int):
         """Remove old step data to prevent memory leak."""
         steps_to_remove = [s for s in self.prepared_data if s < current_step - 1]
