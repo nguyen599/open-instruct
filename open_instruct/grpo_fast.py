@@ -1685,6 +1685,23 @@ def one_training_step(
     }
     # Print only scalar metrics
     scalar_metrics = {k: v for k, v in metrics.items() if isinstance(v, float | int)}
+    reward_metric_keys = sorted(
+        key
+        for key in scalar_metrics
+        if key == "scores"
+        or "reward" in key
+        or "correct_rate" in key
+        or key.startswith("advantages_")
+    )
+    if reward_metric_keys:
+        logger.info(
+            "Reward metrics step=%s %s",
+            training_step,
+            " ".join(
+                f"{key}={float(scalar_metrics[key]):.4g}"
+                for key in reward_metric_keys
+            ),
+        )
     print_rich_single_line_metrics(scalar_metrics)
 
     if args.with_tracking:

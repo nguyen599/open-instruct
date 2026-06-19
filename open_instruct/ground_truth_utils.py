@@ -1143,6 +1143,16 @@ class DeepSeekMathV2Verifier(VerifierFunction):
     """DeepSeekMath-V2-style proof reward with API or local-vLLM proof/meta judges."""
 
     SCORE_VALUES = (0.0, 0.5, 1.0)
+    MAX_FORWARDED_SELF_EVALUATION_CHARS = 12_000
+    THINK_BLOCK_PATTERN = re.compile(r"(?is)<think>.*?</think>\s*")
+    VISIBLE_OUTPUT_MARKERS = (
+        "## Solution",
+        "## Self Evaluation",
+        "Based on my evaluation",
+        "Based on my analysis",
+        "Here is my evaluation",
+        "Here is my analysis",
+    )
 
     def __init__(self, verifier_config: DeepSeekMathV2VerifierConfig) -> None:
         super().__init__("deepseekmath_v2", verifier_config=verifier_config, weight=1.0)
@@ -1210,34 +1220,96 @@ class DeepSeekMathV2Verifier(VerifierFunction):
         return None
 
     @staticmethod
-    def _extract_sections(prediction: str) -> tuple[str, str, list[str]]:
+    def _header_matches(text: str, header: str) -> list[re.Match[str]]:
+        header_pattern = re.escape(header.strip()).replace(r"\ ", r"[ \t]+")
+        return list(re.finditer(rf"(?im)^[ \t]*{header_pattern}[ \t]*:?[ \t]*$", text))
+
+    @classmethod
+    def _strip_reasoning_blocks(cls, text: str) -> tuple[str, bool]:
+        raw = str(text or "")
+        found_thinking = bool(re.search(r"(?is)</think>\s*", raw))
+        cleaned = cls.THINK_BLOCK_PATTERN.sub("", raw)
+        orphan_close = re.search(r"(?is)</think>\s*", cleaned)
+        if orphan_close is not None:
+            first_marker = min(
+                (
+                    idx
+                    for marker in cls.VISIBLE_OUTPUT_MARKERS
+                    if (idx := cleaned.lower().find(marker.lower())) >= 0
+                ),
+                default=None,
+            )
+            if first_marker is None or orphan_close.start() < first_marker:
+                prefix = cleaned[: orphan_close.start()]
+                suffix = cleaned[orphan_close.end() :]
+                if "<think" not in prefix.lower():
+                    cleaned = suffix
+        return cleaned.strip(), found_thinking
+
+    @classmethod
+    def _clip_middle_text(cls, text: str, max_chars: int) -> tuple[str, bool]:
+        cleaned = str(text or "").strip()
+        if max_chars <= 0 or len(cleaned) <= max_chars:
+            return cleaned, False
+        marker = "\n\n[... clipped middle reasoning before forwarding ...]\n\n"
+        if max_chars <= len(marker) + 20:
+            return cleaned[-max_chars:], True
+        head_chars = (max_chars - len(marker)) // 2
+        tail_chars = max_chars - len(marker) - head_chars
+        return f"{cleaned[:head_chars]}{marker}{cleaned[-tail_chars:]}", True
+
+    @classmethod
+    def _extract_sections(cls, prediction: str) -> tuple[str, str, list[str], dict[str, Any]]:
         errors: list[str] = []
-        solution_match = re.search(r"(?im)^[ \t]*##[ \t]+Solution[ \t]*$", prediction)
-        self_eval_match = re.search(r"(?im)^[ \t]*##[ \t]+Self[ \t]+Evaluation[ \t]*$", prediction)
+        raw_chars = len(prediction or "")
+        visible_prediction, found_thinking = cls._strip_reasoning_blocks(prediction)
+        visible_chars = len(visible_prediction)
+        solution_matches = cls._header_matches(visible_prediction, "## Solution")
+        self_eval_matches = cls._header_matches(visible_prediction, "## Self Evaluation")
 
-        if not solution_match:
+        if not solution_matches:
             errors.append("missing_solution_heading")
-        if not self_eval_match:
+        if not self_eval_matches:
             errors.append("missing_self_evaluation_heading")
-        if solution_match and self_eval_match and self_eval_match.start() <= solution_match.start():
-            errors.append("self_evaluation_before_solution")
 
-        if solution_match and self_eval_match and self_eval_match.start() > solution_match.start():
-            solution = prediction[solution_match.end() : self_eval_match.start()].strip()
-            self_evaluation = prediction[self_eval_match.end() :].strip()
+        solution_match = solution_matches[-1] if solution_matches else None
+        self_eval_match = None
+        if solution_match is not None:
+            self_eval_match = next(
+                (match for match in self_eval_matches if match.start() > solution_match.end()),
+                None,
+            )
+        elif self_eval_matches:
+            self_eval_match = self_eval_matches[0]
+
+        if solution_match is not None and self_eval_match is not None:
+            solution = visible_prediction[solution_match.end() : self_eval_match.start()].strip()
+            self_evaluation = visible_prediction[self_eval_match.end() :].strip()
+        elif solution_match is not None:
+            solution = visible_prediction[solution_match.end() :].strip()
+            self_evaluation = ""
         else:
-            solution = prediction.strip()
+            solution = visible_prediction.strip()
             self_evaluation = ""
 
         if not solution:
             errors.append("empty_solution")
         if not self_evaluation:
             errors.append("empty_self_evaluation")
-        return solution, self_evaluation, errors
+        metadata = {
+            "raw_chars": raw_chars,
+            "visible_chars": visible_chars,
+            "found_thinking_block": found_thinking,
+            "solution_chars": len(solution),
+            "self_evaluation_chars": len(self_evaluation),
+            "solution_sections": len(solution_matches),
+            "self_evaluation_sections": len(self_eval_matches),
+        }
+        return solution, self_evaluation, errors, metadata
 
     @classmethod
     def parse_prediction(cls, prediction: str) -> DeepSeekMathV2ParsedResponse:
-        solution, self_evaluation, errors = cls._extract_sections(prediction)
+        solution, self_evaluation, errors, metadata = cls._extract_sections(prediction)
         if self_evaluation and "Here is my evaluation of the solution:" not in self_evaluation:
             errors.append("missing_evaluation_phrase")
         if self_evaluation and "Based on my evaluation, the final overall score should be:" not in self_evaluation:
@@ -1245,6 +1317,19 @@ class DeepSeekMathV2Verifier(VerifierFunction):
         self_score = cls._extract_score(self_evaluation)
         if self_score is None:
             errors.append("missing_or_invalid_boxed_self_score")
+        logger.info(
+            "DeepSeekMath-V2 parsed rollout raw_chars=%d visible_chars=%d found_thinking=%s "
+            "solution_chars=%d self_evaluation_chars=%d solution_sections=%d "
+            "self_evaluation_sections=%d format_errors=%s",
+            metadata["raw_chars"],
+            metadata["visible_chars"],
+            metadata["found_thinking_block"],
+            metadata["solution_chars"],
+            metadata["self_evaluation_chars"],
+            metadata["solution_sections"],
+            metadata["self_evaluation_sections"],
+            errors,
+        )
         return DeepSeekMathV2ParsedResponse(
             solution=solution,
             self_evaluation=self_evaluation,
@@ -1485,13 +1570,24 @@ class DeepSeekMathV2Verifier(VerifierFunction):
             )
 
         question = self._resolve_problem(label, query)
+        forwarded_self_evaluation, self_eval_clipped = self._clip_middle_text(
+            parsed.self_evaluation,
+            self.MAX_FORWARDED_SELF_EVALUATION_CHARS,
+        )
+        if self_eval_clipped:
+            logger.info(
+                "DeepSeekMath-V2 clipped self evaluation for meta judge from %d to %d chars.",
+                len(parsed.self_evaluation),
+                len(forwarded_self_evaluation),
+            )
+
         values = {
             "question": question,
             "proof": parsed.solution,
             "solution": parsed.solution,
-            "proof_analysis": parsed.self_evaluation,
-            "proof analysis": parsed.self_evaluation,
-            "self_evaluation": parsed.self_evaluation,
+            "proof_analysis": forwarded_self_evaluation,
+            "proof analysis": forwarded_self_evaluation,
+            "self_evaluation": forwarded_self_evaluation,
             "prediction": prediction,
             "label": label,
         }
