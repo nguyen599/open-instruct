@@ -2141,6 +2141,8 @@ def _discover_tools_from_datasets(dataset_mixer_list: list[str], dataset_mixer_l
         dataset_path = pathlib.Path(dataset_name)
         if dataset_path.is_file() and dataset_path.suffix == ".parquet":
             ds = datasets.load_dataset("parquet", data_files=str(dataset_path), split=split)
+        elif dataset_path.is_file() and dataset_path.suffix == ".csv":
+            ds = datasets.load_dataset("csv", data_files=str(dataset_path), split=split)
         elif dataset_path.is_file() and dataset_path.suffix in {".json", ".jsonl"}:
             ds = datasets.load_dataset("json", data_files=str(dataset_path), split=split)
         else:

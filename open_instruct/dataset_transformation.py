@@ -2145,10 +2145,16 @@ class DatasetConfig:
 
     def __post_init__(self):
         # if the file exists locally, use the local file
-        if os.path.exists(self.dataset_name) and self.dataset_name.endswith(".jsonl"):
-            assert self.dataset_split == "train", "Only train split is supported for local jsonl files."
+        if os.path.exists(self.dataset_name) and self.dataset_name.endswith((".json", ".jsonl")):
+            assert self.dataset_split == "train", "Only train split is supported for local json/jsonl files."
             dataset = load_dataset(
                 "json", data_files=self.dataset_name, split=self.dataset_split, num_proc=max_num_processes(),
+                keep_in_memory=True
+            )
+        elif os.path.exists(self.dataset_name) and self.dataset_name.endswith(".csv"):
+            assert self.dataset_split == "train", "Only train split is supported for local csv files."
+            dataset = load_dataset(
+                "csv", data_files=self.dataset_name, split=self.dataset_split, num_proc=max_num_processes(),
                 keep_in_memory=True
             )
         elif os.path.exists(self.dataset_name) and self.dataset_name.endswith(".parquet"):

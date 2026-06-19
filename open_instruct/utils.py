@@ -433,6 +433,8 @@ def get_datasets(
             # if dataset ends with .json or .jsonl, load from file
             if ds.endswith(".json") or ds.endswith(".jsonl"):
                 dataset = load_dataset("json", data_files=ds, split=split, num_proc=max_num_processes())
+            elif ds.endswith(".csv"):
+                dataset = load_dataset("csv", data_files=ds, split=split, num_proc=max_num_processes())
             elif ds.endswith(".parquet"):
                 dataset = load_dataset("parquet", data_files=ds, split=split, num_proc=max_num_processes())
             else:
@@ -637,6 +639,10 @@ def combine_dataset(
         # if dataset ends with .json or .jsonl, load from file
         if ds.endswith(".json") or ds.endswith(".jsonl"):
             dataset = load_dataset("json", data_files=ds, split=split, num_proc=max_num_processes())
+        elif ds.endswith(".csv"):
+            dataset = load_dataset("csv", data_files=ds, split=split, num_proc=max_num_processes())
+        elif ds.endswith(".parquet"):
+            dataset = load_dataset("parquet", data_files=ds, split=split, num_proc=max_num_processes())
         else:
             try:
                 # Try first if dataset on a Hub repo
