@@ -1371,6 +1371,7 @@ def create_vllm_engines(
     eval_dataset=None,
     trust_remote_code: bool = False,
     vllm_attention_backend: str | None = None,
+    disable_custom_all_reduce: bool = False,
 ) -> list[ray.actor.ActorHandle]:
     vllm_engines = []
     # Use "mp" (multiprocessing) for TP > 1 when running inside a Ray actor.
@@ -1458,6 +1459,7 @@ def create_vllm_engines(
                 eval_dataset=eval_dataset,
                 trust_remote_code=trust_remote_code,
                 attention_backend=vllm_attention_backend,
+                disable_custom_all_reduce=disable_custom_all_reduce,
                 language_model_only=True,
             )
         )
