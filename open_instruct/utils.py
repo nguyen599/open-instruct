@@ -1337,14 +1337,19 @@ def retry_on_exception(max_attempts=4, delay=1, backoff=2):
 @functools.lru_cache(maxsize=1)
 def maybe_use_ai2_wandb_entity() -> str | None:
     """Ai2 internal logic: try use the ai2-llm team if possible. Should not affect external users."""
-    wandb.login()
-    api = wandb.Api()
-    current_user = api.viewer
-    teams = current_user.teams
+    if os.environ.get("WANDB_ENTITY"):
+        return os.environ["WANDB_ENTITY"]
+    try:
+        wandb.login()
+        api = wandb.Api()
+        current_user = api.viewer
+        teams = current_user.teams
+    except Exception as exc:
+        logger.warning("Skipping optional W&B entity auto-detection: %s", exc)
+        return None
     if "ai2-llm" in teams:
         return "ai2-llm"
-    else:
-        return None
+    return None
 
 
 @retry_on_exception()
