@@ -1448,7 +1448,53 @@ class DeepSeekMathV2Verifier(VerifierFunction):
         ) / 1_000_000
 
     @staticmethod
-    def _estimate_messages_tokens(messages: list[dict[str, str]], model: str) -> tuple[int, str]:
+    def _token_count_from_tokenizer(messages: list[dict[str, str]], tokenizer: Any) -> tuple[int, str] | None:
+        tokenizer = getattr(tokenizer, "tokenizer", tokenizer)
+        tokenizer_name = getattr(tokenizer, "name_or_path", None) or tokenizer.__class__.__name__
+        try:
+            token_ids = tokenizer.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+            )
+        except Exception as exc:
+            logger.debug("HF chat-template token counting failed for %s: %s", tokenizer_name, exc)
+        else:
+            if isinstance(token_ids, dict):
+                token_ids = token_ids.get("input_ids", token_ids)
+            if hasattr(token_ids, "input_ids"):
+                token_ids = token_ids.input_ids
+            if hasattr(token_ids, "tolist"):
+                token_ids = token_ids.tolist()
+            if isinstance(token_ids, list) and token_ids and isinstance(token_ids[0], list):
+                token_ids = token_ids[0]
+            try:
+                return len(token_ids), f"hf_chat_template:{tokenizer_name}"
+            except TypeError:
+                logger.debug("HF chat-template token IDs for %s had unsupported type %s", tokenizer_name, type(token_ids))
+
+        rendered = "\n\n".join(f"{message.get('role', 'user')}:\n{message.get('content', '')}" for message in messages)
+        try:
+            token_ids = tokenizer.encode(rendered, add_special_tokens=True)
+        except Exception as exc:
+            logger.debug("HF tokenizer encode fallback failed for %s: %s", tokenizer_name, exc)
+            return None
+        if hasattr(token_ids, "tolist"):
+            token_ids = token_ids.tolist()
+        return len(token_ids), f"hf_encode:{tokenizer_name}"
+
+    @classmethod
+    def _estimate_messages_tokens(
+        cls,
+        messages: list[dict[str, str]],
+        model: str,
+        tokenizer: Any | None = None,
+    ) -> tuple[int, str]:
+        if tokenizer is not None:
+            tokenizer_count = cls._token_count_from_tokenizer(messages, tokenizer)
+            if tokenizer_count is not None:
+                return tokenizer_count
+
         try:
             encoding = context_window_checker.get_encoding_for_model(model)
             total_tokens = 0
@@ -1461,6 +1507,66 @@ class DeepSeekMathV2Verifier(VerifierFunction):
             logger.warning("DeepSeekMath-V2 judge token estimate failed for %s: %s; using chars/4 fallback.", model, exc)
             return max(1, total_chars // 4), "chars_per_4"
 
+    @classmethod
+    def _truncate_messages_with_tokenizer(
+        cls,
+        messages: list[dict[str, str]],
+        model: str,
+        tokenizer: Any,
+        max_prompt_tokens: int,
+    ) -> list[dict[str, str]]:
+        truncated = copy.deepcopy(messages)
+        marker = "\n\n[... truncated to fit judge context window ...]\n\n"
+
+        def count_tokens(candidate_messages: list[dict[str, str]]) -> int:
+            return cls._estimate_messages_tokens(candidate_messages, model, tokenizer=tokenizer)[0]
+
+        if count_tokens(truncated) <= max_prompt_tokens:
+            return truncated
+
+        candidate_indices = [
+            idx
+            for idx, message in enumerate(truncated)
+            if isinstance(message.get("content"), str) and message.get("content")
+        ]
+        candidate_indices.sort(
+            key=lambda idx: (
+                truncated[idx].get("role") == "system",
+                -len(truncated[idx].get("content", "")),
+            )
+        )
+
+        for idx in candidate_indices:
+            if count_tokens(truncated) <= max_prompt_tokens:
+                break
+            original = truncated[idx].get("content", "")
+            if not original:
+                continue
+
+            def clipped_content(char_budget: int) -> str:
+                if char_budget >= len(original):
+                    return original
+                if char_budget <= len(marker) + 20:
+                    return original[: max(0, char_budget)]
+                head = (char_budget - len(marker)) // 2
+                tail = char_budget - len(marker) - head
+                return f"{original[:head]}{marker}{original[-tail:]}"
+
+            low, high = 0, len(original)
+            best = ""
+            while low <= high:
+                mid = (low + high) // 2
+                trial = copy.deepcopy(truncated)
+                trial[idx]["content"] = clipped_content(mid)
+                if count_tokens(trial) <= max_prompt_tokens:
+                    best = trial[idx]["content"]
+                    low = mid + 1
+                else:
+                    high = mid - 1
+            truncated[idx]["content"] = best
+
+        return truncated
+
     def _effective_judge_max_tokens(
         self,
         messages: list[dict[str, str]],
@@ -1468,8 +1574,9 @@ class DeepSeekMathV2Verifier(VerifierFunction):
         stage: str,
         *,
         max_context_length_override: int | None = None,
+        tokenizer: Any | None = None,
     ) -> tuple[list[dict[str, str]], int]:
-        prompt_tokens, tokenizer_name = self._estimate_messages_tokens(messages, model)
+        prompt_tokens, tokenizer_name = self._estimate_messages_tokens(messages, model, tokenizer=tokenizer)
         configured_context_length = self.config.deepseekmath_v2_max_context_length
         context_length = configured_context_length
         if max_context_length_override is not None:
@@ -1485,15 +1592,24 @@ class DeepSeekMathV2Verifier(VerifierFunction):
         truncated = False
 
         if prompt_tokens + margin + reserved_completion_tokens > context_length:
-            messages = context_window_checker.truncate_messages_to_fit_context(
-                messages=messages,
-                max_completion_tokens=reserved_completion_tokens,
-                model_name=model,
-                max_context_length=context_length,
-                safety_margin=margin,
-            )
+            if tokenizer is not None:
+                max_prompt_tokens = max(1, context_length - reserved_completion_tokens - margin)
+                messages = self._truncate_messages_with_tokenizer(
+                    messages,
+                    model,
+                    tokenizer,
+                    max_prompt_tokens,
+                )
+            else:
+                messages = context_window_checker.truncate_messages_to_fit_context(
+                    messages=messages,
+                    max_completion_tokens=reserved_completion_tokens,
+                    model_name=model,
+                    max_context_length=context_length,
+                    safety_margin=margin,
+                )
             truncated = True
-            prompt_tokens, tokenizer_name = self._estimate_messages_tokens(messages, model)
+            prompt_tokens, tokenizer_name = self._estimate_messages_tokens(messages, model, tokenizer=tokenizer)
             effective_max_tokens = min(configured_max_tokens, max(1, context_length - prompt_tokens - margin))
 
         logger.info(
@@ -1535,15 +1651,18 @@ class DeepSeekMathV2Verifier(VerifierFunction):
 
         messages = build_messages(prompt)
         local_context_length = None
+        local_tokenizer = None
         if local_judge is not None:
             llm_engine = getattr(local_judge, "llm_engine", None)
             model_config = getattr(llm_engine, "model_config", None)
             local_context_length = getattr(model_config, "max_model_len", None)
+            local_tokenizer = getattr(llm_engine, "tokenizer", None)
         messages, max_completion_tokens = self._effective_judge_max_tokens(
             messages,
             model,
             stage,
             max_context_length_override=local_context_length,
+            tokenizer=local_tokenizer,
         )
         _write_prompt_preview(
             f"{stage}_judge",

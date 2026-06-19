@@ -375,6 +375,68 @@ Based on my evaluation, the final overall score should be:
         self.assertNotIn("Hidden proof should not survive parsing", parsed.solution)
         self.assertIn("draft score", parsed.self_evaluation)
 
+    def test_judge_budget_uses_local_chat_template_tokenizer(self):
+        class DummyChatTokenizer:
+            name_or_path = "dummy-olmo"
+
+            def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=True):
+                rendered = "".join(f"<{message['role']}>{message['content']}" for message in messages)
+                if add_generation_prompt:
+                    rendered += "<assistant>"
+                return list(range(len(rendered))) if tokenize else rendered
+
+            def encode(self, text, add_special_tokens=True):
+                return list(range(len(text) + int(add_special_tokens)))
+
+        count, tokenizer_name = DeepSeekMathV2Verifier._estimate_messages_tokens(
+            [{"role": "user", "content": "abc"}],
+            "local-model",
+            tokenizer=DummyChatTokenizer(),
+        )
+
+        self.assertGreater(count, 0)
+        self.assertEqual(tokenizer_name, "hf_chat_template:dummy-olmo")
+
+    def test_judge_budget_truncates_with_local_chat_template_tokenizer(self):
+        class DummyChatTokenizer:
+            name_or_path = "dummy-olmo"
+
+            def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=True):
+                rendered = "".join(f"<{message['role']}>{message['content']}" for message in messages)
+                if add_generation_prompt:
+                    rendered += "<assistant>"
+                return list(range(len(rendered))) if tokenize else rendered
+
+        config = dataclasses.replace(
+            self.config,
+            deepseekmath_v2_max_tokens=64,
+            deepseekmath_v2_max_context_length=80,
+            deepseekmath_v2_context_margin_tokens=4,
+            deepseekmath_v2_min_completion_tokens=16,
+        )
+        verifier = DeepSeekMathV2Verifier(config)
+        messages = [
+            {"role": "system", "content": "keep-system"},
+            {"role": "user", "content": "x" * 200},
+        ]
+
+        truncated_messages, max_tokens = verifier._effective_judge_max_tokens(
+            messages,
+            "local-model",
+            "proof",
+            max_context_length_override=80,
+            tokenizer=DummyChatTokenizer(),
+        )
+        prompt_tokens, _ = verifier._estimate_messages_tokens(
+            truncated_messages,
+            "local-model",
+            tokenizer=DummyChatTokenizer(),
+        )
+
+        self.assertEqual(truncated_messages[0]["content"], "keep-system")
+        self.assertLess(len(truncated_messages[1]["content"]), len(messages[1]["content"]))
+        self.assertLessEqual(prompt_tokens + max_tokens + 4, 80)
+
     def test_async_call_forwards_only_visible_solution_to_proof_and_meta_judges(self):
         prediction = r"""<think>HIDDEN_REASONING_SHOULD_NOT_BE_FORWARDED</think>
 
