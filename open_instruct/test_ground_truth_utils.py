@@ -531,6 +531,54 @@ Based on my evaluation, the final overall score should be:
         client_cls.assert_called_once_with(api_key="test-key", base_url="https://example.test/v1", timeout=30)
         self.assertEqual(create_mock.await_args_list[0].kwargs["model"], "judge-model")
 
+    def test_async_call_scores_single_hash_solution_with_nonfatal_self_eval_format_error(self):
+        prediction = """<think>HIDDEN_REASONING_SHOULD_NOT_BE_FORWARDED</think>
+
+# Solution
+VISIBLE_SINGLE_HASH_SOLUTION
+
+# Self Evaluate
+This self evaluation has no required score phrase, but the proof should still be judged.
+"""
+        create_mock = AsyncMock(
+            side_effect=[
+                _make_openai_response(r"Here is my evaluation of the solution: correct.\n\n\boxed{1}"),
+                _make_openai_response(r"Here is my analysis of the solution evaluation: weak format.\n\n\boxed{0}"),
+            ]
+        )
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create_mock)),
+            close=AsyncMock(),
+        )
+
+        with (
+            patch("open_instruct.ground_truth_utils.AsyncOpenAI", return_value=client),
+            patch.object(
+                DeepSeekMathV2Verifier,
+                "_estimate_messages_tokens",
+                return_value=(100, "test-tokenizer"),
+            ),
+        ):
+            result = asyncio.run(
+                self.verifier.async_call(
+                    tokenized_prediction=[],
+                    prediction=prediction,
+                    label={"problem": "prove this"},
+                    query=None,
+                )
+            )
+
+        self.assertAlmostEqual(result.score, 0.76)
+        self.assertEqual(create_mock.await_count, 2)
+        proof_prompt = "\n".join(message["content"] for message in create_mock.await_args_list[0].kwargs["messages"])
+        payload = ground_truth_utils.json.loads(result.reasoning)
+
+        self.assertIn("VISIBLE_SINGLE_HASH_SOLUTION", proof_prompt)
+        self.assertNotIn("HIDDEN_REASONING_SHOULD_NOT_BE_FORWARDED", proof_prompt)
+        self.assertNotIn("This self evaluation has no required score phrase", proof_prompt)
+        self.assertIn("missing_score_phrase", payload["format_errors"])
+        self.assertTrue(payload["nonfatal_format_errors_allowed"])
+
     def test_async_call_returns_zero_without_required_format(self):
         create_mock = AsyncMock()
         client = SimpleNamespace(

@@ -1205,10 +1205,15 @@ class DeepSeekMathV2Verifier(VerifierFunction):
 
     SCORE_VALUES = (0.0, 0.5, 1.0)
     MAX_FORWARDED_SELF_EVALUATION_CHARS = 12_000
+    FATAL_FORMAT_ERRORS = frozenset({"missing_solution_heading", "empty_solution"})
     THINK_BLOCK_PATTERN = re.compile(r"(?is)<think>.*?</think>\s*")
     VISIBLE_OUTPUT_MARKERS = (
+        "# Solution",
         "## Solution",
+        "# Self Evaluation",
         "## Self Evaluation",
+        "# Self Evaluate",
+        "## Self Evaluate",
         "Based on my evaluation",
         "Based on my analysis",
         "Here is my evaluation",
@@ -1281,9 +1286,28 @@ class DeepSeekMathV2Verifier(VerifierFunction):
         return None
 
     @staticmethod
-    def _header_matches(text: str, header: str) -> list[re.Match[str]]:
-        header_pattern = re.escape(header.strip()).replace(r"\ ", r"[ \t]+")
-        return list(re.finditer(rf"(?im)^[ \t]*{header_pattern}[ \t]*:?[ \t]*$", text))
+    def _contains_any_phrase(text: str, phrases: tuple[str, ...]) -> bool:
+        lowered = str(text or "").lower()
+        return any(phrase.lower() in lowered for phrase in phrases)
+
+    @classmethod
+    def _header_matches(cls, text: str, header: str) -> list[re.Match[str]]:
+        header_name = re.sub(r"^#+[ \t]*", "", header.strip()).strip()
+        header_names = [header_name]
+        if header_name.lower().replace("-", " ") == "self evaluation":
+            header_names.extend(["Self Evaluate", "Self-Evaluate", "Self-Evaluation"])
+
+        matches: list[re.Match[str]] = []
+        for name in header_names:
+            name_pattern = re.escape(name).replace(r"\ ", r"[ \t]+").replace(r"\-", r"[- ]")
+            matches.extend(
+                re.finditer(
+                    rf"(?im)^[ \t]*(?:#{{1,6}}[ \t]*)?{name_pattern}[ \t]*:?[ \t]*(?://.*)?$",
+                    text,
+                )
+            )
+        unique_matches = {(match.start(), match.end()): match for match in matches}
+        return [unique_matches[key] for key in sorted(unique_matches)]
 
     @classmethod
     def _strip_reasoning_blocks(cls, text: str) -> tuple[str, bool]:
@@ -1371,9 +1395,24 @@ class DeepSeekMathV2Verifier(VerifierFunction):
     @classmethod
     def parse_prediction(cls, prediction: str) -> DeepSeekMathV2ParsedResponse:
         solution, self_evaluation, errors, metadata = cls._extract_sections(prediction)
-        if self_evaluation and "Here is my evaluation of the solution:" not in self_evaluation:
+        if self_evaluation and not cls._contains_any_phrase(
+            self_evaluation,
+            (
+                "Here is my evaluation of the solution:",
+                "Detailed evaluation:",
+                "Detailed evaluation",
+            ),
+        ):
             errors.append("missing_evaluation_phrase")
-        if self_evaluation and "Based on my evaluation, the final overall score should be:" not in self_evaluation:
+        if self_evaluation and not cls._contains_any_phrase(
+            self_evaluation,
+            (
+                "Based on my evaluation, the final overall score should be:",
+                "Based on my evaluation, the final overall score is:",
+                "final overall score should be:",
+                "final overall score is:",
+            ),
+        ):
             errors.append("missing_score_phrase")
         self_score = cls._extract_score(self_evaluation)
         if self_score is None:
@@ -1746,13 +1785,15 @@ class DeepSeekMathV2Verifier(VerifierFunction):
         rollout_state: dict | None = None,
     ) -> VerificationResult:
         parsed = self.parse_prediction(prediction)
-        if self.config.deepseekmath_v2_require_format and not parsed.format_ok:
+        fatal_format_errors = [error for error in parsed.format_errors if error in self.FATAL_FORMAT_ERRORS]
+        if self.config.deepseekmath_v2_require_format and fatal_format_errors:
             return VerificationResult(
                 score=0.0,
                 reasoning=json.dumps(
                     {
                         "format_ok": False,
                         "format_errors": parsed.format_errors,
+                        "fatal_format_errors": fatal_format_errors,
                         "proof_score": None,
                         "self_score": parsed.self_score,
                         "self_eval_score": None,
@@ -1810,7 +1851,7 @@ class DeepSeekMathV2Verifier(VerifierFunction):
                 )
 
             if not self.config.deepseekmath_v2_enable_meta_verification:
-                reward = proof_score if parsed.format_ok or not self.config.deepseekmath_v2_require_format else 0.0
+                reward = proof_score
                 return VerificationResult(
                     score=reward,
                     cost=total_cost,
@@ -1823,25 +1864,28 @@ class DeepSeekMathV2Verifier(VerifierFunction):
                             "self_eval_score": None,
                             "score_alignment": None,
                             "meta_verification_enabled": False,
+                            "nonfatal_format_errors_allowed": bool(parsed.format_errors),
                         },
                         ensure_ascii=False,
                     ),
                 )
 
-            meta_content, meta_cost = await self._call_judge(
-                self._render_template(self.meta_prompt_template, values),
-                self.config.meta_model(),
-                "meta",
-                rollout_state=rollout_state,
-            )
-            total_cost += meta_cost
-            self_eval_score = self._extract_score(meta_content)
-            if self_eval_score is None:
+            if parsed.self_evaluation:
+                meta_content, meta_cost = await self._call_judge(
+                    self._render_template(self.meta_prompt_template, values),
+                    self.config.meta_model(),
+                    "meta",
+                    rollout_state=rollout_state,
+                )
+                total_cost += meta_cost
+                self_eval_score = self._extract_score(meta_content)
+                if self_eval_score is None:
+                    self_eval_score = 0.0
+            else:
                 self_eval_score = 0.0
             self_score = parsed.self_score if parsed.self_score is not None else 0.0
             score_alignment = max(0.0, 1.0 - abs(self_score - proof_score))
-            format_multiplier = 1.0 if parsed.format_ok or not self.config.deepseekmath_v2_require_format else 0.0
-            reward = format_multiplier * (
+            reward = (
                 self.config.deepseekmath_v2_proof_weight * proof_score
                 + self.config.deepseekmath_v2_self_eval_weight * score_alignment * self_eval_score
             )
@@ -1859,6 +1903,7 @@ class DeepSeekMathV2Verifier(VerifierFunction):
                         "self_eval_score": self_eval_score,
                         "score_alignment": score_alignment,
                         "reward": reward,
+                        "nonfatal_format_errors_allowed": bool(parsed.format_errors),
                     },
                     ensure_ascii=False,
                 ),
